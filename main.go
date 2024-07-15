@@ -14,7 +14,8 @@ import (
 /*
 	example: curl -X POST http://localhost:8080/query -H "Content-Type: application/json" -d '{"find": "testing", "filter": {"name": "Daria"}}'
 	example: curl -X POST http://localhost:8080/query -H "Content-Type: application/json" -d '{"insert": "testing", "documents": [{"name": "John", "age": "79"}]}'
-	example:  curl -X POST http://localhost:8080/query -H "Content-Type: application/json" -d '{"delete": "testing", "filter": {"name": "Helen"}}'
+	example: curl -X POST http://localhost:8080/query -H "Content-Type: application/json" -d '{"delete": "testing", "filter": {"name": "Helen"}}'
+	example: curl -X POST http://localhost:8080/query -H "Content-Type: application/json" -d '{"update": "testing", "filter": {"name": "Mike"}, "updateFields": {"age": 31}}'
 */
 
 type ProxyServer struct {
@@ -54,8 +55,8 @@ func (ps *ProxyServer) handleQuery(w http.ResponseWriter, r *http.Request) {
 		ps.handleFind(w, mongoQuery)
 	case mongoQuery["insert"] != nil:
 		ps.handleInsert(w, mongoQuery)
-	//case mongoQuery["update"] != nil:
-	//	ps.handleUpdate(w, mongoQuery)
+	case mongoQuery["update"] != nil:
+		ps.handleUpdate(w, mongoQuery)
 	case mongoQuery["delete"] != nil:
 		ps.handleDelete(w, mongoQuery)
 	default:
@@ -119,32 +120,6 @@ func (ps *ProxyServer) handleInsert(w http.ResponseWriter, mongoQuery map[string
 	}
 }
 
-/*
-func (ps *ProxyServer) handleUpdate(w http.ResponseWriter, mongoQuery map[string]interface{}) {
-	if update, ok := mongoQuery["update"].(string); ok {
-		sqlQuery, err := ps.convertUpdateToSQL(update, mongoQuery["filter"], mongoQuery["update"])
-		if err != nil {
-			log.Printf("Error converting update query to SQL: %v", err)
-			http.Error(w, "Request conversion error", http.StatusInternalServerError)
-			return
-		}
-
-		log.Printf("Executing SQL query: %s", sqlQuery)
-		_, err = ps.db.Exec(sqlQuery)
-		if err != nil {
-			log.Printf("Error executing query: %v", err)
-			http.Error(w, "Request execution error", http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status": "success"}`))
-	} else {
-		http.Error(w, "Invalid update request", http.StatusBadRequest)
-	}
-}
-*/
-
 func (ps *ProxyServer) handleDelete(w http.ResponseWriter, mongoQuery map[string]interface{}) {
 	if del, ok := mongoQuery["delete"].(string); ok {
 		sqlQuery, err := ps.convertDeleteToSQL(del, mongoQuery["filter"])
@@ -166,6 +141,30 @@ func (ps *ProxyServer) handleDelete(w http.ResponseWriter, mongoQuery map[string
 		w.Write([]byte(`{"status": "success"}`))
 	} else {
 		http.Error(w, "Invalid delete request", http.StatusBadRequest)
+	}
+}
+
+func (ps *ProxyServer) handleUpdate(w http.ResponseWriter, mongoQuery map[string]interface{}) {
+	if update, ok := mongoQuery["update"].(string); ok {
+		sqlQuery, err := ps.convertUpdateToSQL(update, mongoQuery["filter"], mongoQuery["updateFields"])
+		if err != nil {
+			log.Printf("Error converting update query to SQL: %v", err)
+			http.Error(w, "Request conversion error", http.StatusInternalServerError)
+			return
+		}
+
+		log.Printf("Executing SQL query: %s", sqlQuery)
+		_, err = ps.db.Exec(sqlQuery)
+		if err != nil {
+			log.Printf("Error executing query: %v", err)
+			http.Error(w, "Request execution error", http.StatusInternalServerError)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status": "success"}`))
+	} else {
+		http.Error(w, "Invalid update request", http.StatusBadRequest)
 	}
 }
 
@@ -203,40 +202,42 @@ func (ps *ProxyServer) convertInsertToSQL(collection string, documents interface
 	return "", fmt.Errorf("incorrect format")
 }
 
-/*
-func (ps *ProxyServer) convertUpdateToSQL(collection string, filter interface{}, update interface{}) (string, error) {
-	var setClauses []string
-	if updateMap, ok := update.(map[string]interface{}); ok {
-		for key, value := range updateMap {
-			setClauses = append(setClauses, fmt.Sprintf("%s = '%v'", key, value))
-		}
-	}
-	sqlQuery := fmt.Sprintf("UPDATE %s SET %s", collection, strings.Join(setClauses, ", "))
+func (ps *ProxyServer) convertDeleteToSQL(collection string, filter interface{}) (string, error) {
+	sqlQuery := fmt.Sprintf("DELETE FROM %s", collection)
 	if filterMap, ok := filter.(map[string]interface{}); ok {
-		var whereClauses []string
+		var where []string
 		for key, value := range filterMap {
-			whereClauses = append(whereClauses, fmt.Sprintf("%s = '%v'", key, value))
+			where = append(where, fmt.Sprintf("%s = '%v'", key, value))
 		}
-		if len(whereClauses) > 0 {
-			sqlQuery += " WHERE " + strings.Join(whereClauses, " AND ")
+		if len(where) > 0 {
+			sqlQuery += " WHERE " + strings.Join(where, " AND ")
 		}
 	}
 	return sqlQuery, nil
 }
-*/
 
-func (ps *ProxyServer) convertDeleteToSQL(collection string, filter interface{}) (string, error) {
-	sqlQuery := fmt.Sprintf("DELETE FROM %s", collection)
+func (ps *ProxyServer) convertUpdateToSQL(collection string, filter interface{}, updateFields interface{}) (string, error) {
 	if filterMap, ok := filter.(map[string]interface{}); ok {
-		var whereClauses []string
+		var setClauses []string
+		if updateMap, ok := updateFields.(map[string]interface{}); ok {
+			for key, value := range updateMap {
+				setClauses = append(setClauses, fmt.Sprintf("%s = '%v'", key, value))
+			}
+		}
+
+		var where []string
 		for key, value := range filterMap {
-			whereClauses = append(whereClauses, fmt.Sprintf("%s = '%v'", key, value))
+			where = append(where, fmt.Sprintf("%s = '%v'", key, value))
 		}
-		if len(whereClauses) > 0 {
-			sqlQuery += " WHERE " + strings.Join(whereClauses, " AND ")
+
+		sqlQuery := fmt.Sprintf("UPDATE %s SET %s", collection, strings.Join(setClauses, ", "))
+		if len(where) > 0 {
+			sqlQuery += " WHERE " + strings.Join(where, " AND ")
 		}
+
+		return sqlQuery, nil
 	}
-	return sqlQuery, nil
+	return "", fmt.Errorf("incorrect format")
 }
 
 func (ps *ProxyServer) rowsToJSON(rows *sql.Rows) ([]byte, error) {
