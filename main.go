@@ -78,7 +78,6 @@ func worker(wg *sync.WaitGroup, client *mongo.Client, id int) {
 	defer cancel()
 
 	// Пример запроса на вставку (insert)
-
 	insertResult, err := collection.InsertOne(ctx, bson.D{{"name", "example"}, {"worker", id}})
 	if err != nil {
 		log.Printf("Worker %d insert: %v\n", id, err)
@@ -100,18 +99,31 @@ func worker(wg *sync.WaitGroup, client *mongo.Client, id int) {
 	err = collection.FindOne(ctx, filter).Decode(&result)
 	if err != nil {
 		log.Printf("Worker %d find: %v\n", id, err)
-		//return
+		return
 	}
 	fmt.Printf("Worker %d found a single document: %+v\n", id, result)
 
+	// Пример запроса на обновление (update)
+	updateFilter := bson.D{{"name", "example"}, {"worker", id}}
+	update := bson.D{
+		{"$set", bson.D{
+			{"name", "updated_example"},
+		}},
+	}
+	updateResult, err := collection.UpdateOne(ctx, updateFilter, update)
+	if err != nil {
+		log.Printf("Worker %d update: %v\n", id, err)
+		return
+	}
+	fmt.Printf("Worker %d updated %d document(s)\n", id, updateResult.ModifiedCount)
+
 	// Пример запроса на удаление (delete)
-	deleteResult, err := collection.DeleteOne(ctx, bson.D{{"name", "example"}, {"worker", id}})
+	deleteResult, err := collection.DeleteOne(ctx, bson.D{{"name", "updated_example"}, {"worker", id}})
 	if err != nil {
 		log.Printf("Worker %d delete: %v\n", id, err)
 		return
 	}
 	fmt.Printf("Worker %d deleted %d document(s)\n", id, deleteResult.DeletedCount)
-
 }
 
 func main() {
