@@ -1,265 +1,168 @@
 package main
 
 import (
-	"database/sql"
-	"encoding/json"
+	"context"
 	"fmt"
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 	"log"
-	"net/http"
-	"strings"
-
-	_ "github.com/lib/pq"
+	"sync"
+	"time"
 )
 
-/*
-	example: curl -X POST http://localhost:8080/query -H "Content-Type: application/json" -d '{"find": "testing", "filter": {"name": "Daria"}}'
-	example: curl -X POST http://localhost:8080/query -H "Content-Type: application/json" -d '{"insert": "testing", "documents": [{"name": "John", "age": "79"}]}'
-	example: curl -X POST http://localhost:8080/query -H "Content-Type: application/json" -d '{"delete": "testing", "filter": {"name": "Helen"}}'
-	example: curl -X POST http://localhost:8080/query -H "Content-Type: application/json" -d '{"update": "testing", "filter": {"name": "Mike"}, "updateFields": {"age": 31}}'
-*/
+/*func listDatabases(client *mongo.Client) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-type ProxyServer struct {
-	db *sql.DB
+	databases, err := client.ListDatabaseNames(ctx, bson.D{})
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("Databases:")
+	for _, db := range databases {
+		fmt.Println("- ", db)
+	}
+	return nil
+}*/
+
+/*func listCollections(client *mongo.Client, dbName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	collectionNames, err := client.Database(dbName).ListCollectionNames(ctx, bson.D{})
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Collections in database %s:\n", dbName)
+	for _, coll := range collectionNames {
+		fmt.Println("- ", coll)
+	}
+	return nil
+}*/
+
+/*func createCollectionIfNotExists(client *mongo.Client, dbName, collName string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	collectionNames, err := client.Database(dbName).ListCollectionNames(ctx, bson.D{})
+	if err != nil {
+		return err
+	}
+
+	for _, name := range collectionNames {
+		if name == collName {
+			fmt.Printf("Collection %s already exists in database %s\n", collName, dbName)
+			return nil
+		}
+	}
+
+	err = client.Database(dbName).CreateCollection(ctx, collName)
+	if err != nil {
+		return err
+	}
+
+	fmt.Printf("Collection %s created in database %s\n", collName, dbName)
+	return nil
+}*/
+
+func worker(wg *sync.WaitGroup, client *mongo.Client, id int) {
+	defer wg.Done()
+
+	collection := client.Database("testdb").Collection("testcollection")
+
+	// Создание контекста с тайм-аутом
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Пример запроса на вставку (insert)
+
+	insertResult, err := collection.InsertOne(ctx, bson.D{{"name", "example"}, {"worker", id}})
+	if err != nil {
+		log.Printf("Worker %d insert: %v\n", id, err)
+		return
+	}
+	fmt.Printf("Worker %d inserted a document: %v\n", id, insertResult.InsertedID)
+
+	// Еще один пример запроса на вставку (insert)
+	insertResult, err = collection.InsertOne(ctx, bson.D{{"name", "example2"}, {"worker", id}})
+	if err != nil {
+		log.Printf("Worker %d insert: %v\n", id, err)
+		return
+	}
+	fmt.Printf("Worker %d inserted another document: %v\n", id, insertResult.InsertedID)
+
+	// Пример запроса на чтение (find)
+	var result bson.M
+	filter := bson.D{{"name", "example"}}
+	err = collection.FindOne(ctx, filter).Decode(&result)
+	if err != nil {
+		log.Printf("Worker %d find: %v\n", id, err)
+		//return
+	}
+	fmt.Printf("Worker %d found a single document: %+v\n", id, result)
+
+	// Пример запроса на удаление (delete)
+	deleteResult, err := collection.DeleteOne(ctx, bson.D{{"name", "example"}, {"worker", id}})
+	if err != nil {
+		log.Printf("Worker %d delete: %v\n", id, err)
+		return
+	}
+	fmt.Printf("Worker %d deleted %d document(s)\n", id, deleteResult.DeletedCount)
+
 }
 
 func main() {
-	connStr := "user=user1 password=passwd dbname=postgres sslmode=disable"
-	db, err := sql.Open("postgres", connStr)
+	clientOptions := options.Client().ApplyURI("mongodb://localhost:5039")
+	client, err := mongo.Connect(context.TODO(), clientOptions)
 	if err != nil {
-		log.Fatalf("Error connecting to PostgreSQL: %v", err)
+		log.Fatal(err)
 	}
-	defer db.Close()
 
-	err = db.Ping()
+	err = client.Ping(context.TODO(), nil)
 	if err != nil {
-		log.Fatalf("Db connection error: %v", err)
+		log.Fatal(err)
 	}
+	fmt.Println("Connected to MongoDB!")
 
-	log.Println("Successful connection")
-
-	proxy := &ProxyServer{db: db}
-	http.HandleFunc("/query", proxy.handleQuery)
-	log.Fatal(http.ListenAndServe(":8080", nil))
-}
-
-func (ps *ProxyServer) handleQuery(w http.ResponseWriter, r *http.Request) {
-	var mongoQuery map[string]interface{}
-	if err := json.NewDecoder(r.Body).Decode(&mongoQuery); err != nil {
-		log.Printf("Error decoding request body: %v", err)
-		http.Error(w, "Invalid request", http.StatusBadRequest)
-		return
-	}
-
-	switch {
-	case mongoQuery["find"] != nil:
-		ps.handleFind(w, mongoQuery)
-	case mongoQuery["insert"] != nil:
-		ps.handleInsert(w, mongoQuery)
-	case mongoQuery["update"] != nil:
-		ps.handleUpdate(w, mongoQuery)
-	case mongoQuery["delete"] != nil:
-		ps.handleDelete(w, mongoQuery)
-	default:
-		http.Error(w, "Invalid request", http.StatusBadRequest)
-	}
-}
-
-func (ps *ProxyServer) handleFind(w http.ResponseWriter, mongoQuery map[string]interface{}) {
-	if find, ok := mongoQuery["find"].(string); ok {
-		sqlQuery, err := ps.convertFindToSQL(find, mongoQuery["filter"])
-		if err != nil {
-			log.Printf("Error converting find query to SQL: %v", err)
-			http.Error(w, "Request conversion error", http.StatusInternalServerError)
-			return
-		}
-
-		log.Printf("Executing SQL query: %s", sqlQuery)
-		rows, err := ps.db.Query(sqlQuery)
-		if err != nil {
-			log.Printf("Error executing query: %v", err)
-			http.Error(w, "Request execution error", http.StatusInternalServerError)
-			return
-		}
-		defer rows.Close()
-
-		result, err := ps.rowsToJSON(rows)
-		if err != nil {
-			log.Printf("Error processing result: %v", err)
-			http.Error(w, "Error processing result", http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.Write(result)
-	} else {
-		http.Error(w, "Invalid find request", http.StatusBadRequest)
-	}
-}
-
-func (ps *ProxyServer) handleInsert(w http.ResponseWriter, mongoQuery map[string]interface{}) {
-	if insert, ok := mongoQuery["insert"].(string); ok {
-		sqlQuery, err := ps.convertInsertToSQL(insert, mongoQuery["documents"])
-		if err != nil {
-			log.Printf("Error converting insert query to SQL: %v", err)
-			http.Error(w, "Request conversion error", http.StatusInternalServerError)
-			return
-		}
-
-		log.Printf("Executing SQL query: %s", sqlQuery)
-		_, err = ps.db.Exec(sqlQuery)
-		if err != nil {
-			log.Printf("Error executing query: %v", err)
-			http.Error(w, "Request execution error", http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status": "success"}`))
-	} else {
-		http.Error(w, "Invalid insert request", http.StatusBadRequest)
-	}
-}
-
-func (ps *ProxyServer) handleDelete(w http.ResponseWriter, mongoQuery map[string]interface{}) {
-	if del, ok := mongoQuery["delete"].(string); ok {
-		sqlQuery, err := ps.convertDeleteToSQL(del, mongoQuery["filter"])
-		if err != nil {
-			log.Printf("Error converting delete query to SQL: %v", err)
-			http.Error(w, "Request conversion error", http.StatusInternalServerError)
-			return
-		}
-
-		log.Printf("Executing SQL query: %s", sqlQuery)
-		_, err = ps.db.Exec(sqlQuery)
-		if err != nil {
-			log.Printf("Error executing query: %v", err)
-			http.Error(w, "Request execution error", http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status": "success"}`))
-	} else {
-		http.Error(w, "Invalid delete request", http.StatusBadRequest)
-	}
-}
-
-func (ps *ProxyServer) handleUpdate(w http.ResponseWriter, mongoQuery map[string]interface{}) {
-	if update, ok := mongoQuery["update"].(string); ok {
-		sqlQuery, err := ps.convertUpdateToSQL(update, mongoQuery["filter"], mongoQuery["updateFields"])
-		if err != nil {
-			log.Printf("Error converting update query to SQL: %v", err)
-			http.Error(w, "Request conversion error", http.StatusInternalServerError)
-			return
-		}
-
-		log.Printf("Executing SQL query: %s", sqlQuery)
-		_, err = ps.db.Exec(sqlQuery)
-		if err != nil {
-			log.Printf("Error executing query: %v", err)
-			http.Error(w, "Request execution error", http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{"status": "success"}`))
-	} else {
-		http.Error(w, "Invalid update request", http.StatusBadRequest)
-	}
-}
-
-func (ps *ProxyServer) convertFindToSQL(collection string, filter interface{}) (string, error) {
-	var where []string
-	if filterMap, ok := filter.(map[string]interface{}); ok {
-		for key, value := range filterMap {
-			where = append(where, fmt.Sprintf("%s = '%v'", key, value))
-		}
-	}
-	sqlQuery := fmt.Sprintf("SELECT * FROM %s", collection)
-	if len(where) > 0 {
-		sqlQuery += " WHERE " + strings.Join(where, " AND ")
-	}
-	return sqlQuery, nil
-}
-
-func (ps *ProxyServer) convertInsertToSQL(collection string, documents interface{}) (string, error) {
-	if docs, ok := documents.([]interface{}); ok && len(docs) > 0 {
-		var keys []string
-		var values []string
-		for key := range docs[0].(map[string]interface{}) {
-			keys = append(keys, key)
-		}
-		for _, doc := range docs {
-			var valueList []string
-			for _, key := range keys {
-				valueList = append(valueList, fmt.Sprintf("'%v'", doc.(map[string]interface{})[key]))
-			}
-			values = append(values, "("+strings.Join(valueList, ", ")+")")
-		}
-		sqlQuery := fmt.Sprintf("INSERT INTO %s (%s) VALUES %s", collection, strings.Join(keys, ", "), strings.Join(values, ", "))
-		return sqlQuery, nil
-	}
-	return "", fmt.Errorf("incorrect format")
-}
-
-func (ps *ProxyServer) convertDeleteToSQL(collection string, filter interface{}) (string, error) {
-	sqlQuery := fmt.Sprintf("DELETE FROM %s", collection)
-	if filterMap, ok := filter.(map[string]interface{}); ok {
-		var where []string
-		for key, value := range filterMap {
-			where = append(where, fmt.Sprintf("%s = '%v'", key, value))
-		}
-		if len(where) > 0 {
-			sqlQuery += " WHERE " + strings.Join(where, " AND ")
-		}
-	}
-	return sqlQuery, nil
-}
-
-func (ps *ProxyServer) convertUpdateToSQL(collection string, filter interface{}, updateFields interface{}) (string, error) {
-	if filterMap, ok := filter.(map[string]interface{}); ok {
-		var setClauses []string
-		if updateMap, ok := updateFields.(map[string]interface{}); ok {
-			for key, value := range updateMap {
-				setClauses = append(setClauses, fmt.Sprintf("%s = '%v'", key, value))
-			}
-		}
-
-		var where []string
-		for key, value := range filterMap {
-			where = append(where, fmt.Sprintf("%s = '%v'", key, value))
-		}
-
-		sqlQuery := fmt.Sprintf("UPDATE %s SET %s", collection, strings.Join(setClauses, ", "))
-		if len(where) > 0 {
-			sqlQuery += " WHERE " + strings.Join(where, " AND ")
-		}
-
-		return sqlQuery, nil
-	}
-	return "", fmt.Errorf("incorrect format")
-}
-
-func (ps *ProxyServer) rowsToJSON(rows *sql.Rows) ([]byte, error) {
-	columns, err := rows.Columns()
+	/*err = listDatabases(client)
 	if err != nil {
-		return nil, err
+		log.Fatal(err)
+	}*/
+
+	/*dbName := "testdb"
+	err = listCollections(client, dbName)
+	if err != nil {
+		log.Fatal(err)
+	}*/
+
+	/*collName := "testcollection"
+	err = createCollectionIfNotExists(client, dbName, collName)
+	if err != nil {
+		log.Fatal(err)
+	}*/
+
+	// Создание WaitGroup для ожидания завершения всех горутин
+	var wg sync.WaitGroup
+
+	// Количество горутин для запуска
+	numWorkers := 1
+
+	// Запуск горутин
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go worker(&wg, client, i)
 	}
 
-	var result []map[string]interface{}
-	for rows.Next() {
-		row := make(map[string]interface{})
-		columnPointers := make([]interface{}, len(columns))
-		for i := range columns {
-			columnPointers[i] = new(interface{})
-		}
-		if err := rows.Scan(columnPointers...); err != nil {
-			return nil, err
-		}
-		for i, colName := range columns {
-			row[colName] = *(columnPointers[i].(*interface{}))
-		}
-		result = append(result, row)
+	// Ожидание завершения всех горутин
+	wg.Wait()
+
+	// Отключение от сервера
+	err = client.Disconnect(context.TODO())
+	if err != nil {
+		log.Fatal(err)
 	}
-	return json.Marshal(result)
+	fmt.Println("Connection to MongoDB closed.")
 }
