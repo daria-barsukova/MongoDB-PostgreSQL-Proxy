@@ -25,6 +25,13 @@ PG_MODULE_MAGIC;
 #define PG_CONNINFO "dbname=postgres user=user1 password=passwd host=localhost port=5432"
 
 
+#define BODY_MSG_SECTION_TYPE 0
+#define DOC_MSG_SECTION_TYPE 1
+
+#define MAX_BSON_OBJECTS 10
+
+
+
 PGDLLEXPORT int main_proxy(void);
 
 void accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents);
@@ -32,6 +39,13 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents);
 void write_cb(struct ev_loop *loop, struct ev_io *watcher, int revents);
 bool insert_to_postgres(const char *json_query);
 void process_message(uint32_t response_to, unsigned char *buffer, unsigned char response[BUFFER_SIZE]);
+//void parse_mongodb_packet(char *buffer, char **json_strings[MAX_BSON_OBJECTS]); 
+void parse_mongodb_packet(char *buffer, char **query_string, char **parameter_string);
+void parse_query(char *buffer);
+//int parse_message(char *buffer, char *(*json_strings[MAX_BSON_OBJECTS]));
+int parse_message(char *buffer, char **query_string, char **parameter_string);
+int parse_bson_object(char *my_data, bson_t **my_bson);
+ssize_t get_str_len_from_doc_seq(char *doc_seq);
 
 int flag = 0;
 int server_sd = -1;
@@ -197,18 +211,21 @@ int main_proxy(void) {
 }
 
 void accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
+    int client_sd;
+    struct ev_io *w_client;
+
     if (EV_ERROR & revents) {
         perror("got invalid event");
         return;
     }
 
-    int client_sd = accept(watcher->fd, NULL, NULL);
+    client_sd = accept(watcher->fd, NULL, NULL);
     if (client_sd < 0) {
         perror("accept error");
         return;
     }
 
-    struct ev_io *w_client = (struct ev_io *) malloc(sizeof(struct ev_io));
+    w_client = (struct ev_io *) malloc(sizeof(struct ev_io));
     if (!w_client) {
         perror("malloc error");
         close(client_sd);
@@ -220,13 +237,16 @@ void accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
 }
 
 void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
+    unsigned char buffer[BUFFER_SIZE];
+    ssize_t read;
+
     if (EV_ERROR & revents) {
         perror("got invalid event");
         return;
     }
 
-    unsigned char buffer[BUFFER_SIZE];
-    ssize_t read = recv(watcher->fd, buffer, BUFFER_SIZE, 0);
+    
+    read = recv(watcher->fd, buffer, BUFFER_SIZE, 0);
 
     if (read < 0) {
         perror("read error");
@@ -240,6 +260,7 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
         return;
     }
 
+/*
     uint32_t message_length = ((uint32_t *) buffer)[0];
     uint32_t request_id = ((uint32_t *) buffer)[1];
     uint32_t response_to = ((uint32_t *) buffer)[2];
@@ -268,6 +289,20 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
             elog(WARNING, "UNKNOWN OP_CODE :(");
     }
     memset(buffer, 0, BUFFER_SIZE);
+    */
+
+
+    char **query_string = (char **) malloc(sizeof(char*));
+    char **parameter_string = (char **) malloc(sizeof(char*));
+
+    parse_mongodb_packet(buffer, query_string, parameter_string);
+
+
+    free(*query_string);
+    free(*parameter_string);
+    free(query_string);
+    free(parameter_string);
+   
 }
 
 void write_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
@@ -292,4 +327,227 @@ void _PG_init(void) {
     snprintf(worker.bgw_type, BGW_MAXLEN, "Proxy");
 
     RegisterBackgroundWorker(&worker);
+}
+
+
+
+
+
+void parse_mongodb_packet(char *buffer, char **query_string, char **parameter_string) {
+    //header
+    u_int32_t msg_length = 0;
+    u_int32_t request_id = 0;
+    u_int32_t response_to = 0;
+    u_int32_t op_code = 0;    
+
+    msg_length = ((u_int32_t*)buffer)[0];
+    request_id = ((u_int32_t*)buffer)[1];
+    response_to = ((u_int32_t*)buffer)[2];
+    op_code = ((u_int32_t*)buffer)[3];    
+
+    switch (op_code) {
+    case OP_QUERY:
+        //parse_query(buffer);
+        break;
+    case OP_MSG:
+    
+        parse_message(buffer, query_string, parameter_string);
+        break;
+    case OP_REPLY:
+        /* code */
+        break;
+    default:
+        perror("UNKNOWN OP_CODE\n");
+        return;
+    }
+    
+}
+
+
+/**
+ * return 0 if everything is successful
+ * return -1 if not (for example, if smth with length of char *my_data)
+ */
+int parse_message(char *buffer, char **query_string, char **parameter_string) {
+    u_int32_t flags = ((u_int32_t*)buffer)[4];
+    int overall_sections_start_bit = 20; //because of mongodb protocol
+    int overall_sections_end_bit = ((u_int32_t*)buffer)[0]; //msg_length
+    u_int32_t msg_length = ((u_int32_t*)buffer)[0]; //msg_length
+    u_int32_t checksum = 0;
+    char section_kind = 0;
+    bson_t *b[MAX_BSON_OBJECTS]; //array of *bson_t formed by parsing OP_MSG message type
+    int next_bson_to_get = 0; //an index of b to be filled next
+    int section_start = 0;
+    //for converting strings to query_string, parameter_string
+    int par_string_len;
+    int len_of_par_strings = 0;
+    char **jsons;
+    
+    if (flags && (1 << 7)) {
+        overall_sections_end_bit -= 4; //it means there is a checksum in the end of the packet
+        ///////////later : add buffersize <?> msg_length check
+        checksum = ((u_int32_t*)buffer)[msg_length / sizeof(u_int32_t) - 1]; //the checksum
+    }
+
+
+    section_start = overall_sections_start_bit;
+
+    for (; section_start < overall_sections_end_bit;) { 
+        
+        int add_to_section_start = 0;
+        section_kind = buffer[section_start];
+        section_start ++; //bc we got section kind
+
+        switch (section_kind)
+        {
+        case BODY_MSG_SECTION_TYPE:
+        /**
+         * A body section is encoded as a single BSON object. 
+         * The size in the BSON object also serves as the size of the section.
+         * */
+            int flag_local = parse_bson_object((buffer + section_start), &(b[next_bson_to_get]));
+            if (flag_local < 0) {
+                return -1; //it means smth bad with parsing bson
+            }
+
+            next_bson_to_get++;
+            add_to_section_start += ((u_int32_t*)(buffer + section_start))[0];
+            break;
+        case DOC_MSG_SECTION_TYPE:
+        /**
+         * A Document Sequence section contains:
+         * int32 - size of the section
+         * cstring - Document sequence identifier.
+         * Zero or more BSON objects
+         * */
+            u_int32_t size_section = ((u_int32_t*)(buffer + section_start))[0];
+            // YES, it starts with the section start, not by cstring start - look at func realization
+            ssize_t doc_string_len = get_str_len_from_doc_seq(buffer + section_start);
+            if (doc_string_len < 0) {
+                elog(ERROR, "UNKNOWN PROBLEM WITH STRING");
+                return -1; //it means smth wrong with string => smth wrong with buffer/packet
+            }
+
+            //this is wwhere bsons located
+            add_to_section_start += doc_string_len + 4; //size of the string + size of the section
+            int j = 0;
+            for (j = section_start + add_to_section_start; j < section_start + size_section; ) {
+                u_int32_t my_bson_size = ((u_int32_t*)(buffer + j))[0];
+                int flag_local = parse_bson_object((char *)(buffer + j), &(b[next_bson_to_get]));
+                if (flag_local < 0) {
+                    elog(ERROR, "PROBLEMS WITH PARSING BSON\n");
+                    return -1; //it means smth bad with parsing bson
+                }
+                
+                next_bson_to_get++;
+                j += my_bson_size;
+            }
+            add_to_section_start = j - section_start;
+            break;
+        
+        default:
+            elog(ERROR, "UNKNOWN SECTION KIND: %d\n", section_kind);
+            return -1;
+            break;
+        }
+
+
+        section_start += add_to_section_start;
+
+    }
+
+    //it  means there were no bsons
+    if (next_bson_to_get == 0) {
+        return -1;
+    }
+
+    size_t len_of_string = 0;
+    char *str = bson_as_relaxed_extended_json (b[0], &len_of_string);
+    *query_string = (char *) malloc(len_of_string + 1);
+    memset(*query_string, 0, len_of_string + 1);
+    memcpy(*query_string, str, len_of_string);
+    bson_free (str);
+
+    
+
+    **jsons = (char **)malloc((next_bson_to_get - 1) * sizeof(char *));
+
+
+    for (int i = 1; i < next_bson_to_get; ++i) {
+        size_t len_of_string = 0;
+        jsons[i] = bson_as_relaxed_extended_json (b[i], &len_of_string);
+
+        len_of_par_strings += len_of_string;
+    }
+
+    if (next_bson_to_get != 1) {
+
+        par_string_len = (len_of_par_strings + 2 * (next_bson_to_get - 1) + 1) * sizeof(char *);
+
+        *parameter_string = (char *) malloc(par_string_len);
+        int now = 0;
+
+        memset(*parameter_string, 0, par_string_len);
+        memcpy(*parameter_string, "[", 1);
+        now += 1;
+
+        for (int i = 1; i < next_bson_to_get; ++i) {
+            if (i +1 != next_bson_to_get) {
+
+                memcpy((char *)(*parameter_string + now), jsons[i], strlen(jsons[i]));
+                now += strlen(jsons[i]);
+                memcpy((char *)(*parameter_string + now), ", ", 2);
+                now += 2;
+            } else {
+                memcpy((char *)(*parameter_string + now), jsons[i], strlen(jsons[i]));
+                now += strlen(jsons[i]);
+                memcpy((char *)(*parameter_string + now), "]", 1);
+                now += 1;
+            }
+        }
+    }
+
+
+    for (int i = 1; i < next_bson_to_get; ++i) {
+        bson_free(jsons[i]);
+    }
+
+    free(jsons);
+    return 0;
+}
+
+
+/**
+ * <just a light wrapper on bson_new_from_data(const uint8_t *data, size_t length) from libbson.h
+ * may be removed later>
+ * return 0 if everything is ok
+ * return -1 if not (espesially if smth with length of char *my_data)
+ */
+int parse_bson_object(char *my_data, bson_t **my_bson) {
+    size_t my_data_len = ((u_int32_t*)my_data)[0];
+    *my_bson = bson_new_from_data (my_data, my_data_len);
+    if (!my_bson) {
+        return -1;
+    }
+    return 0;
+}
+
+
+/**
+ * if string is valid (ends with '\0'), return (strlen(string in doc seq) + 1)
+ * else return -1
+ */
+ssize_t get_str_len_from_doc_seq(char *doc_seq) {
+    u_int32_t section_size = ((u_int32_t*)doc_seq)[0];
+    ssize_t count = 0;
+
+    for (int i = 4; i < (int)section_size; ++i) {
+        if (doc_seq[i] == '\0') {
+            count++;
+            return count;
+        }
+        count++;
+    }
+
+    return -1;
 }
