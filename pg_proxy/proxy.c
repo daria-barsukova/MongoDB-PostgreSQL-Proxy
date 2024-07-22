@@ -17,7 +17,7 @@
 PG_MODULE_MAGIC;
 #endif
 
-#define MONGO_PORT 5013
+#define MONGO_PORT 5011
 #define BUFFER_SIZE 1024
 #define OP_QUERY 2004
 #define OP_REPLY 1
@@ -642,6 +642,160 @@ bool execute_query_update_to_postgres(const char *json_metadata, const char *jso
 
     return true;
 }
+bool execute_find_query(PGconn *conn, const char *table_name, struct json_object *find_json, struct json_object **results) {
+    struct json_object *filter_json, *limit_json, *single_batch_json;
+    char condition[BUFFER_SIZE] = "";
+    int limit = -1;
+    bool single_batch = false;
+
+    if (json_object_object_get_ex(find_json, "filter", &filter_json)) {
+        struct json_object_iterator it = json_object_iter_begin(filter_json);
+        struct json_object_iterator it_end = json_object_iter_end(filter_json);
+
+        while (!json_object_iter_equal(&it, &it_end)) {
+            const char *field_name = json_object_iter_peek_name(&it);
+            struct json_object *field_value = json_object_iter_peek_value(&it);
+            const char *value_str = json_object_get_string(field_value);
+
+            strcat(condition, field_name);
+            strcat(condition, "='");
+            strcat(condition, value_str);
+            strcat(condition, "' AND ");
+
+            json_object_iter_next(&it);
+        }
+
+        // Remove the last " AND "
+        if (strlen(condition) > 0) {
+            condition[strlen(condition) - 5] = '\0';
+        }
+    }
+
+    if (json_object_object_get_ex(find_json, "limit", &limit_json)) {
+        limit = json_object_get_int(limit_json);
+    }
+
+    if (json_object_object_get_ex(find_json, "singleBatch", &single_batch_json)) {
+        single_batch = json_object_get_boolean(single_batch_json);
+    }
+
+    char query[BUFFER_SIZE];
+    if (strlen(condition) > 0) {
+        if (limit > 0) {
+            snprintf(query, sizeof(query), "SELECT * FROM %s WHERE %s LIMIT %d", table_name, condition, limit);
+        } else {
+            snprintf(query, sizeof(query), "SELECT * FROM %s WHERE %s", table_name, condition);
+        }
+    } else {
+        if (limit > 0) {
+            snprintf(query, sizeof(query), "SELECT * FROM %s LIMIT %d", table_name, limit);
+        } else {
+            snprintf(query, sizeof(query), "SELECT * FROM %s", table_name);
+        }
+    }
+
+    PGresult *res = PQexec(conn, query);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        fprintf(stderr, "SELECT command failed: %s", PQerrorMessage(conn));
+        PQclear(res);
+        return false;
+    }
+
+    int rows = PQntuples(res);
+    *results = json_object_new_array();
+
+    for (int i = 0; i < rows; i++) {
+        struct json_object *row_obj = json_object_new_object();
+        int n_fields = PQnfields(res);
+
+        for (int j = 0; j < n_fields; j++) {
+            const char *field_name = PQfname(res, j);
+            const char *field_value = PQgetvalue(res, i, j);
+            json_object_object_add(row_obj, field_name, json_object_new_string(field_value));
+        }
+        json_object_array_add(*results, row_obj);
+    }
+
+    PQclear(res);
+    return true;
+}
+
+bool execute_query_find_to_postgres(const char *json_metadata, struct json_object **results) {
+    PGconn *conn = PQconnectdb(PG_CONNINFO);
+    if (PQstatus(conn) != CONNECTION_OK) {
+        fprintf(stderr, "Connection to database failed: %s", PQerrorMessage(conn));
+        PQfinish(conn);
+        return false;
+    }
+
+    struct json_object *metadata_json = json_tokener_parse(json_metadata);
+    if (!metadata_json) {
+        fprintf(stderr, "Failed to parse metadata JSON\n");
+        PQfinish(conn);
+        return false;
+    }
+
+    struct json_object *find_obj, *db_obj;
+    if (!json_object_object_get_ex(metadata_json, "find", &find_obj) ||
+        !json_object_object_get_ex(metadata_json, "$db", &db_obj)) {
+        fprintf(stderr, "Invalid metadata JSON format\n");
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    const char *collection = json_object_get_string(find_obj);
+    const char *dbname = json_object_get_string(db_obj);
+
+    if (!check_and_create_database(conn, dbname)) {
+        fprintf(stderr, "Failed to create or check database\n");
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    PQfinish(conn);
+
+    char conninfo[BUFFER_SIZE];
+    snprintf(conninfo, sizeof(conninfo), "dbname=%s user=user1 password=passwd port=5433", dbname);
+    conn = PQconnectdb(conninfo);
+    if (PQstatus(conn) != CONNECTION_OK) {
+        fprintf(stderr, "Connection to database %s failed: %s", dbname, PQerrorMessage(conn));
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    if (!check_and_create_table(conn, collection)) {
+        fprintf(stderr, "Failed to create or check table\n");
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    struct json_object *find_json = json_tokener_parse(json_metadata);
+    if (!find_json) {
+        fprintf(stderr, "Failed to parse find JSON\n");
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    if (!execute_find_query(conn, collection, find_json, results)) {
+        fprintf(stderr, "Failed to execute find query\n");
+        json_object_put(metadata_json);
+        json_object_put(find_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    json_object_put(metadata_json);
+    json_object_put(find_json);
+    PQfinish(conn);
+
+    return true;
+}
+
 
 void process_message(uint32_t response_to, unsigned char *buffer,  char *json_metadata, char *json_data_array) {
 
@@ -715,6 +869,18 @@ void process_message(uint32_t response_to, unsigned char *buffer,  char *json_me
             memset(buffer, 0, BUFFER_SIZE);
             return;
         }
+    }
+    if (buffer[26] == 'f') {
+        struct json_object *results;
+        if (execute_query_find_to_postgres(json_metadata, &results)) {
+            flag = 10;
+            fprintf(stderr, "Find query executed successfully. Results:\n%s\n", json_object_to_json_string_ext(results, JSON_C_TO_STRING_PRETTY));
+        } else {
+            fprintf(stderr, "Failed to execute find query\n");
+        }
+
+        json_object_put(results);
+        return;
     }
 }
 
@@ -875,6 +1041,10 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
             }
             if (flag == 8) {
                 elog(WARNING, "send update");
+                send(watcher->fd, ok_query_response, sizeof(ok_query_response), 0);
+            }
+            if (flag == 10) {
+                elog(WARNING, "send find");
                 send(watcher->fd, ok_query_response, sizeof(ok_query_response), 0);
             }
             if (flag == 5) {
