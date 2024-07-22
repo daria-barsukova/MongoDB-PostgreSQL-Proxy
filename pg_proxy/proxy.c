@@ -39,10 +39,8 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents);
 void write_cb(struct ev_loop *loop, struct ev_io *watcher, int revents);
 bool insert_to_postgres(const char *json_query);
 void process_message(uint32_t response_to, unsigned char *buffer, unsigned char response[BUFFER_SIZE]);
-//void parse_mongodb_packet(char *buffer, char **json_strings[MAX_BSON_OBJECTS]); 
 void parse_mongodb_packet(char *buffer, char **query_string, char **parameter_string);
 void parse_query(char *buffer);
-//int parse_message(char *buffer, char *(*json_strings[MAX_BSON_OBJECTS]));
 int parse_message(char *buffer, char **query_string, char **parameter_string);
 int parse_bson_object(char *my_data, bson_t **my_bson);
 ssize_t get_str_len_from_doc_seq(char *doc_seq);
@@ -240,6 +238,14 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     unsigned char buffer[BUFFER_SIZE];
     ssize_t read;
 
+    char **query_string;
+    char **parameter_string;
+    u_int32_t msg_length = 0;
+    u_int32_t request_id = 0;
+    u_int32_t response_to = 0;
+    u_int32_t op_code = 0; 
+
+
     if (EV_ERROR & revents) {
         perror("got invalid event");
         return;
@@ -293,15 +299,11 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
 
 
 
-    char **query_string = (char **) malloc(sizeof(char*));
-    char **parameter_string = (char **) malloc(sizeof(char*));
+    query_string = (char **) malloc(sizeof(char*));
+    parameter_string = (char **) malloc(sizeof(char*));
 
-    //parse_mongodb_packet(buffer, query_string, parameter_string);
 
-    u_int32_t msg_length = 0;
-    u_int32_t request_id = 0;
-    u_int32_t response_to = 0;
-    u_int32_t op_code = 0;    
+       
 
     msg_length = ((u_int32_t*)buffer)[0];
     request_id = ((u_int32_t*)buffer)[1];
@@ -359,42 +361,9 @@ void _PG_init(void) {
 
 
 
-
-void parse_mongodb_packet(char *buffer, char **query_string, char **parameter_string) {
-    //header
-    u_int32_t msg_length = 0;
-    u_int32_t request_id = 0;
-    u_int32_t response_to = 0;
-    u_int32_t op_code = 0;    
-
-    msg_length = ((u_int32_t*)buffer)[0];
-    request_id = ((u_int32_t*)buffer)[1];
-    response_to = ((u_int32_t*)buffer)[2];
-    op_code = ((u_int32_t*)buffer)[3];    
-
-    switch (op_code) {
-    case OP_QUERY:
-        //parse_query(buffer);
-        break;
-    case OP_MSG:
-    
-        parse_message(buffer, query_string, parameter_string);
-        break;
-    case OP_REPLY:
-        /* code */
-        break;
-    default:
-        perror("UNKNOWN OP_CODE\n");
-        return;
-    }
-    
-}
-
-
-
 /**
  * return 0 if everything is successful
- * return -1 if not (for example, if smth with length of char *my_data)
+ * return -1 if not (for example, if smth with length of char *buffer)
  */
 int parse_message(char *buffer, char **query_string, char **parameter_string) {
     u_int32_t flags = ((u_int32_t*)buffer)[4];
