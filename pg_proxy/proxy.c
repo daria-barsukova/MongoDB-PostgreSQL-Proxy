@@ -292,10 +292,37 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     */
 
 
+
     char **query_string = (char **) malloc(sizeof(char*));
     char **parameter_string = (char **) malloc(sizeof(char*));
 
-    parse_mongodb_packet(buffer, query_string, parameter_string);
+    //parse_mongodb_packet(buffer, query_string, parameter_string);
+
+    u_int32_t msg_length = 0;
+    u_int32_t request_id = 0;
+    u_int32_t response_to = 0;
+    u_int32_t op_code = 0;    
+
+    msg_length = ((u_int32_t*)buffer)[0];
+    request_id = ((u_int32_t*)buffer)[1];
+    response_to = ((u_int32_t*)buffer)[2];
+    op_code = ((u_int32_t*)buffer)[3];    
+
+    switch (op_code) {
+    case OP_QUERY:
+        //parse_query(buffer);
+        break;
+    case OP_MSG:
+    
+        parse_message(buffer, query_string, parameter_string);
+        break;
+    case OP_REPLY:
+        /* code */
+        break;
+    default:
+        perror("UNKNOWN OP_CODE\n");
+        return;
+    }
 
 
     free(*query_string);
@@ -362,6 +389,7 @@ void parse_mongodb_packet(char *buffer, char **query_string, char **parameter_st
     }
     
 }
+
 
 
 /**
@@ -470,7 +498,7 @@ int parse_message(char *buffer, char **query_string, char **parameter_string) {
 
     
 
-    **jsons = (char **)malloc((next_bson_to_get - 1) * sizeof(char *));
+    jsons = (char **)malloc((next_bson_to_get - 1) * sizeof(char *));
 
 
     for (int i = 1; i < next_bson_to_get; ++i) {
