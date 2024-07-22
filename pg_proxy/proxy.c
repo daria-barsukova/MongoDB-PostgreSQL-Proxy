@@ -17,12 +17,12 @@
 PG_MODULE_MAGIC;
 #endif
 
-#define MONGO_PORT 5039
+#define MONGO_PORT 5025
 #define BUFFER_SIZE 1024
 #define OP_QUERY 2004
 #define OP_REPLY 1
 #define OP_MSG 2013
-#define PG_CONNINFO "dbname=postgres user=user1 password=passwd host=localhost port=5432"
+#define PG_CONNINFO "dbname=postgres user=user1 password=passwd host=localhost port=5433"
 
 
 #define BODY_MSG_SECTION_TYPE 0
@@ -31,19 +31,28 @@ PG_MODULE_MAGIC;
 #define MAX_BSON_OBJECTS 10
 
 
-
 PGDLLEXPORT int main_proxy(void);
 
 void accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents);
 void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents);
 void write_cb(struct ev_loop *loop, struct ev_io *watcher, int revents);
-bool insert_to_postgres(const char *json_query);
-void process_message(uint32_t response_to, unsigned char *buffer, unsigned char response[BUFFER_SIZE]);
+void process_message(uint32_t response_to, unsigned char *buffer, char *json_metadata,char *json_data_array);
 void parse_mongodb_packet(char *buffer, char **query_string, char **parameter_string);
-void parse_query(char *buffer);
 int parse_message(char *buffer, char **query_string, char **parameter_string);
 int parse_bson_object(char *my_data, bson_t **my_bson);
 ssize_t get_str_len_from_doc_seq(char *doc_seq);
+bool check_and_create_database(PGconn *conn, const char *dbname);
+bool check_and_create_table(PGconn *conn, const char *table_name);
+bool check_and_create_columns(PGconn *conn, const char *table_name, struct json_object *data_json);
+const char *get_json_value_as_string(struct json_object *field_value);
+bool execute_insert_queries(PGconn *conn, const char *table_name, struct json_object *data_array);
+bool execute_query_insert_to_postgres(const char *json_metadata, const char *json_data_array);
+bool execute_delete_queries(PGconn *conn, const char *table_name, struct json_object *delete_array);
+bool execute_query_delete_to_postgres(const char *json_metadata, const char *json_data_array);
+bool execute_update_queries(PGconn *conn, const char *table_name, struct json_object *update_array);
+bool execute_query_update_to_postgres(const char *json_metadata, const char *json_data_array);
+void cleanup_and_exit(struct ev_loop *loop);
+static void handle_sigterm(SIGNAL_ARGS);
 
 int flag = 0;
 int server_sd = -1;
@@ -55,71 +64,547 @@ static void handle_sigterm(SIGNAL_ARGS) {
     exit(0);
 }
 
-bool execute_query_to_postgres(const char *json_query) {
+bool check_and_create_database(PGconn *conn, const char *dbname) {
+    char query[BUFFER_SIZE];
+    snprintf(query, sizeof(query), "SELECT 1 FROM pg_database WHERE datname='%s'", dbname);
 
-    struct json_object *parsed_json = json_tokener_parse(json_query);
-    if (parsed_json == NULL) {
-        elog(WARNING, "Failed to parse JSON query");
-        return false;
-    }
-
-    struct json_object *collection_obj, *data_obj;
-    if (!json_object_object_get_ex(parsed_json, "collection", &collection_obj) ||
-        !json_object_object_get_ex(parsed_json, "data", &data_obj)) {
-        elog(WARNING, "Invalid JSON format");
-        json_object_put(parsed_json); // Free memory
-        return false;
-    }
-
-    const char *collection = json_object_get_string(collection_obj);
-    struct json_object_iterator it = json_object_iter_begin(data_obj);
-    struct json_object_iterator itEnd = json_object_iter_end(data_obj);
-
-    char sql[BUFFER_SIZE] = {0};
-    snprintf(sql, BUFFER_SIZE, "INSERT INTO %s (", collection);
-
-    char columns[BUFFER_SIZE] = {0};
-    char values[BUFFER_SIZE] = {0};
-
-    while (!json_object_iter_equal(&it, &itEnd)) {
-        const char *key = json_object_iter_peek_name(&it);
-        struct json_object *val = json_object_iter_peek_value(&it);
-
-        snprintf(columns + strlen(columns), BUFFER_SIZE - strlen(columns), "%s, ", key);
-        snprintf(values + strlen(values), BUFFER_SIZE - strlen(values), "'%s', ", json_object_get_string(val));
-
-        json_object_iter_next(&it);
-    }
-
-    columns[strlen(columns) - 2] = '\0';
-    values[strlen(values) - 2] = '\0';
-
-    snprintf(sql + strlen(sql), BUFFER_SIZE - strlen(sql), "%s) VALUES (%s);", columns, values);
-
-    PGconn *conn = PQconnectdb(PG_CONNINFO);
-    if (PQstatus(conn) != CONNECTION_OK) {
-        elog(WARNING, "Connection to database failed: %s", PQerrorMessage(conn));
-        PQfinish(conn);
-        json_object_put(parsed_json); // Free memory
-        return false;
-    }
-
-    PGresult *res = PQexec(conn, sql);
-    if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-        elog(WARNING, "SQL command failed: %s", PQerrorMessage(conn));
+    PGresult *res = PQexec(conn, query);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         PQclear(res);
-        PQfinish(conn);
-        json_object_put(parsed_json); // Free memory
         return false;
+    }
+
+    //ALTER USER user1 CREATEDB;
+    if (PQntuples(res) == 0) {
+        PQclear(res);
+        snprintf(query, sizeof(query), "CREATE DATABASE %s", dbname);
+        res = PQexec(conn, query);
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+            PQclear(res);
+            return false;
+        }
     }
 
     PQclear(res);
-    PQfinish(conn);
-    json_object_put(parsed_json);
     return true;
 }
 
-void process_message(uint32_t response_to, unsigned char *buffer, unsigned char response[BUFFER_SIZE]) {
+bool check_and_create_table(PGconn *conn, const char *table_name) {
+    char query[BUFFER_SIZE];
+    snprintf(query, sizeof(query), "SELECT 1 FROM information_schema.tables WHERE table_name='%s'", table_name);
+
+    PGresult *res = PQexec(conn, query);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        PQclear(res);
+        return false;
+    }
+
+    if (PQntuples(res) == 0) {
+        PQclear(res);
+        snprintf(query, sizeof(query), "CREATE TABLE %s (id SERIAL PRIMARY KEY)", table_name);
+        res = PQexec(conn, query);
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+            PQclear(res);
+            return false;
+        }
+    }
+
+    PQclear(res);
+    return true;
+}
+
+bool check_and_create_columns(PGconn *conn, const char *table_name, struct json_object *data_json) {
+    struct json_object_iterator it = json_object_iter_begin(data_json);
+    struct json_object_iterator it_end = json_object_iter_end(data_json);
+
+    while (!json_object_iter_equal(&it, &it_end)) {
+        const char *field_name = json_object_iter_peek_name(&it);
+        // Skip "_id" field
+        if (strcmp(field_name, "_id") == 0) {
+            json_object_iter_next(&it);
+            continue;
+        }
+
+        char query[BUFFER_SIZE];
+        snprintf(query, sizeof(query),
+                 "SELECT 1 FROM information_schema.columns WHERE table_name='%s' AND column_name='%s'", table_name,
+                 field_name);
+
+        PGresult *res = PQexec(conn, query);
+        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+            PQclear(res);
+            return false;
+        }
+
+        if (PQntuples(res) == 0) {
+            PQclear(res);
+            // Determine type of field from JSON object
+            struct json_object *field_value = json_object_iter_peek_value(&it);
+            const char *field_type = "TEXT";
+            if (json_object_is_type(field_value, json_type_int)) {
+                field_type = "INT";
+            } else if (json_object_is_type(field_value, json_type_boolean)) {
+                field_type = "BOOLEAN";
+            } else if (json_object_is_type(field_value, json_type_double)) {
+                field_type = "DOUBLE PRECISION";
+            }
+
+            snprintf(query, sizeof(query), "ALTER TABLE %s ADD COLUMN %s %s", table_name, field_name, field_type);
+            res = PQexec(conn, query);
+            if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+                PQclear(res);
+                return false;
+            }
+        }
+
+        PQclear(res);
+        json_object_iter_next(&it);
+    }
+
+    return true;
+}
+
+const char *get_json_value_as_string(struct json_object *field_value) {
+    if (json_object_is_type(field_value, json_type_string)) {
+        return json_object_get_string(field_value);
+    } else if (json_object_is_type(field_value, json_type_int)) {
+        return json_object_to_json_string(field_value);
+    } else if (json_object_is_type(field_value, json_type_boolean)) {
+        return json_object_to_json_string(field_value);
+    } else if (json_object_is_type(field_value, json_type_double)) {
+        return json_object_to_json_string(field_value);
+    }
+    return NULL;
+}
+
+bool execute_insert_queries(PGconn *conn, const char *table_name, struct json_object *data_array) {
+    int array_length = json_object_array_length(data_array);
+    for (int i = 0; i < array_length; i++) {
+        struct json_object *data_json = json_object_array_get_idx(data_array, i);
+
+        if (!check_and_create_columns(conn, table_name, data_json)) {
+            fprintf(stderr, "Failed to check and create columns\n");
+            return false;
+        }
+
+        // Construct SQL query for insertion
+        struct json_object_iterator it = json_object_iter_begin(data_json);
+        struct json_object_iterator it_end = json_object_iter_end(data_json);
+        char columns[BUFFER_SIZE] = "";
+        char values[BUFFER_SIZE] = "";
+
+        while (!json_object_iter_equal(&it, &it_end)) {
+            const char *field_name = json_object_iter_peek_name(&it);
+            // Skip "_id" field
+            if (strcmp(field_name, "_id") == 0) {
+                json_object_iter_next(&it);
+                continue;
+            }
+
+            struct json_object *field_value = json_object_iter_peek_value(&it);
+
+            strcat(columns, field_name);
+            strcat(columns, ",");
+
+            const char *value_str = get_json_value_as_string(field_value);
+            if (value_str) {
+                strcat(values, "'");
+                strcat(values, value_str);
+                strcat(values, "'");
+            } else {
+                strcat(values, "NULL");
+            }
+            strcat(values, ",");
+
+            json_object_iter_next(&it);
+        }
+
+        // Remove trailing commas
+        columns[strlen(columns) - 1] = '\0';
+        values[strlen(values) - 1] = '\0';
+
+        char query[BUFFER_SIZE];
+        snprintf(query, sizeof(query), "INSERT INTO %s (%s) VALUES (%s)", table_name, columns, values);
+
+        PGresult *res = PQexec(conn, query);
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+            fprintf(stderr, "INSERT command failed: %s", PQerrorMessage(conn));
+            PQclear(res);
+            return false;
+        }
+        PQclear(res);
+    }
+    return true;
+}
+
+bool execute_query_insert_to_postgres(const char *json_metadata, const char *json_data_array) {
+    // Connect to database
+    PGconn *conn = PQconnectdb(PG_CONNINFO);
+    if (PQstatus(conn) != CONNECTION_OK) {
+        fprintf(stderr, "Connection to database failed: %s", PQerrorMessage(conn));
+        PQfinish(conn);
+        return false;
+    }
+
+    // Parse metadata JSON
+    struct json_object *metadata_json = json_tokener_parse(json_metadata);
+    if (!metadata_json) {
+        fprintf(stderr, "Failed to parse metadata JSON\n");
+        PQfinish(conn);
+        return false;
+    }
+
+    struct json_object *insert_obj, *db_obj;
+    if (!json_object_object_get_ex(metadata_json, "insert", &insert_obj) ||
+        !json_object_object_get_ex(metadata_json, "$db", &db_obj)) {
+        fprintf(stderr, "Invalid metadata JSON format\n");
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    const char *collection = json_object_get_string(insert_obj);
+    const char *dbname = json_object_get_string(db_obj);
+
+    // Check and create database if it does not exist
+    if (!check_and_create_database(conn, dbname)) {
+        fprintf(stderr, "Failed to create or check database\n");
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    PQfinish(conn);
+
+    // Connect to specified database
+    char conninfo[BUFFER_SIZE];
+    snprintf(conninfo, sizeof(conninfo), "dbname=%s user=user1 password=passwd port=5433", dbname);
+    conn = PQconnectdb(conninfo);
+    if (PQstatus(conn) != CONNECTION_OK) {
+        fprintf(stderr, "Connection to database %s failed: %s", dbname, PQerrorMessage(conn));
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    // Check and create table if it does not exist
+    if (!check_and_create_table(conn, collection)) {
+        fprintf(stderr, "Failed to create or check table\n");
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    // Parse data JSON array
+    struct json_object *data_array = json_tokener_parse(json_data_array);
+    if (!data_array || json_object_get_type(data_array) != json_type_array) {
+        fprintf(stderr, "Failed to parse data JSON array\n");
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    // Execute insert queries
+    if (!execute_insert_queries(conn, collection, data_array)) {
+        fprintf(stderr, "Failed to execute insert queries\n");
+        json_object_put(metadata_json);
+        json_object_put(data_array);
+        PQfinish(conn);
+        return false;
+    }
+
+    // Clean up
+    json_object_put(metadata_json);
+    json_object_put(data_array);
+    PQfinish(conn);
+
+    return true;
+}
+
+bool execute_delete_queries(PGconn *conn, const char *table_name, struct json_object *delete_array) {
+    int array_length = json_object_array_length(delete_array);
+    for (int i = 0; i < array_length; i++) {
+        struct json_object *delete_json = json_object_array_get_idx(delete_array, i);
+        struct json_object *q_json, *limit_json;
+
+        if (!json_object_object_get_ex(delete_json, "q", &q_json) ||
+            !json_object_object_get_ex(delete_json, "limit", &limit_json)) {
+            fprintf(stderr, "Invalid delete JSON format\n");
+            return false;
+        }
+
+        struct json_object_iterator it = json_object_iter_begin(q_json);
+        struct json_object_iterator it_end = json_object_iter_end(q_json);
+        char condition[BUFFER_SIZE] = "";
+
+        while (!json_object_iter_equal(&it, &it_end)) {
+            const char *field_name = json_object_iter_peek_name(&it);
+            struct json_object *field_value = json_object_iter_peek_value(&it);
+            const char *value_str = json_object_get_string(field_value);
+
+            strcat(condition, field_name);
+            strcat(condition, "='");
+            strcat(condition, value_str);
+            strcat(condition, "' AND ");
+
+            json_object_iter_next(&it);
+        }
+
+        // Remove the last " AND "
+        condition[strlen(condition) - 5] = '\0';
+
+        char query[BUFFER_SIZE];
+        if (json_object_get_int(limit_json) == 0) {
+            snprintf(query, sizeof(query), "DELETE FROM %s WHERE %s", table_name, condition);
+        } else {
+            snprintf(query, sizeof(query),
+                     "WITH del AS (SELECT ctid FROM %s WHERE %s LIMIT 1) "
+                     "DELETE FROM %s WHERE ctid IN (SELECT ctid FROM del)",
+                     table_name, condition, table_name);
+        }
+
+        PGresult *res = PQexec(conn, query);
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+            fprintf(stderr, "DELETE command failed: %s", PQerrorMessage(conn));
+            PQclear(res);
+            return false;
+        }
+        PQclear(res);
+    }
+    return true;
+}
+
+bool execute_query_delete_to_postgres(const char *json_metadata, const char *json_data_array) {
+    PGconn *conn = PQconnectdb(PG_CONNINFO);
+    if (PQstatus(conn) != CONNECTION_OK) {
+        fprintf(stderr, "Connection to database failed: %s", PQerrorMessage(conn));
+        PQfinish(conn);
+        return false;
+    }
+
+    struct json_object *metadata_json = json_tokener_parse(json_metadata);
+    if (!metadata_json) {
+        fprintf(stderr, "Failed to parse metadata JSON\n");
+        PQfinish(conn);
+        return false;
+    }
+
+    struct json_object *delete_obj, *db_obj;
+    if (!json_object_object_get_ex(metadata_json, "delete", &delete_obj) ||
+        !json_object_object_get_ex(metadata_json, "$db", &db_obj)) {
+        fprintf(stderr, "Invalid metadata JSON format\n");
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    const char *collection = json_object_get_string(delete_obj);
+    const char *dbname = json_object_get_string(db_obj);
+
+    if (!check_and_create_database(conn, dbname)) {
+        fprintf(stderr, "Failed to create or check database\n");
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    PQfinish(conn);
+
+    char conninfo[BUFFER_SIZE];
+    snprintf(conninfo, sizeof(conninfo), "dbname=%s user=user1 password=passwd port=5433", dbname);
+    conn = PQconnectdb(conninfo);
+    if (PQstatus(conn) != CONNECTION_OK) {
+        fprintf(stderr, "Connection to database %s failed: %s", dbname, PQerrorMessage(conn));
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    if (!check_and_create_table(conn, collection)) {
+        fprintf(stderr, "Failed to create or check table\n");
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    struct json_object *delete_array = json_tokener_parse(json_data_array);
+    if (!delete_array || json_object_get_type(delete_array) != json_type_array) {
+        fprintf(stderr, "Failed to parse delete JSON array\n");
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    if (!execute_delete_queries(conn, collection, delete_array)) {
+        fprintf(stderr, "Failed to execute delete queries\n");
+        json_object_put(metadata_json);
+        json_object_put(delete_array);
+        PQfinish(conn);
+        return false;
+    }
+
+    json_object_put(metadata_json);
+    json_object_put(delete_array);
+    PQfinish(conn);
+
+    return true;
+}
+
+bool execute_update_queries(PGconn *conn, const char *table_name, struct json_object *update_array) {
+    int array_length = json_object_array_length(update_array);
+    for (int i = 0; i < array_length; i++) {
+        struct json_object *update_json = json_object_array_get_idx(update_array, i);
+        struct json_object *q_json, *u_json, *multi_json;
+
+        if (!json_object_object_get_ex(update_json, "q", &q_json) ||
+            !json_object_object_get_ex(update_json, "u", &u_json)) {
+            fprintf(stderr, "Invalid update JSON format\n");
+            return false;
+        }
+
+        struct json_object_iterator it = json_object_iter_begin(q_json);
+        struct json_object_iterator it_end = json_object_iter_end(q_json);
+        char condition[BUFFER_SIZE] = "";
+
+        while (!json_object_iter_equal(&it, &it_end)) {
+            const char *field_name = json_object_iter_peek_name(&it);
+            struct json_object *field_value = json_object_iter_peek_value(&it);
+            const char *value_str = json_object_get_string(field_value);
+
+            strcat(condition, field_name);
+            strcat(condition, "='");
+            strcat(condition, value_str);
+            strcat(condition, "' AND ");
+
+            json_object_iter_next(&it);
+        }
+
+        // Remove the last " AND "
+        condition[strlen(condition) - 5] = '\0';
+
+        struct json_object *set_json;
+        if (!json_object_object_get_ex(u_json, "$set", &set_json)) {
+            fprintf(stderr, "Invalid update JSON format\n");
+            return false;
+        }
+
+        it = json_object_iter_begin(set_json);
+        it_end = json_object_iter_end(set_json);
+        char set_clause[BUFFER_SIZE] = "";
+
+        while (!json_object_iter_equal(&it, &it_end)) {
+            const char *field_name = json_object_iter_peek_name(&it);
+            struct json_object *field_value = json_object_iter_peek_value(&it);
+            const char *value_str = json_object_get_string(field_value);
+
+            strcat(set_clause, field_name);
+            strcat(set_clause, "='");
+            strcat(set_clause, value_str);
+            strcat(set_clause, "', ");
+
+            json_object_iter_next(&it);
+        }
+
+        // Remove the last ", "
+        set_clause[strlen(set_clause) - 2] = '\0';
+
+        char query[BUFFER_SIZE];
+        if (json_object_object_get_ex(update_json, "multi", &multi_json) && json_object_get_boolean(multi_json)) {
+            snprintf(query, sizeof(query), "UPDATE %s SET %s WHERE %s", table_name, set_clause, condition);
+        } else {
+            snprintf(query, sizeof(query),
+                     "UPDATE %s SET %s WHERE ctid IN (SELECT ctid FROM %s WHERE %s LIMIT 1)",
+                     table_name, set_clause, table_name, condition);
+        }
+
+        PGresult *res = PQexec(conn, query);
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+            fprintf(stderr, "UPDATE command failed: %s", PQerrorMessage(conn));
+            PQclear(res);
+            return false;
+        }
+        PQclear(res);
+    }
+    return true;
+}
+
+bool execute_query_update_to_postgres(const char *json_metadata, const char *json_data_array) {
+    PGconn *conn = PQconnectdb(PG_CONNINFO);
+    if (PQstatus(conn) != CONNECTION_OK) {
+        fprintf(stderr, "Connection to database failed: %s", PQerrorMessage(conn));
+        PQfinish(conn);
+        return false;
+    }
+
+    struct json_object *metadata_json = json_tokener_parse(json_metadata);
+    if (!metadata_json) {
+        fprintf(stderr, "Failed to parse metadata JSON\n");
+        PQfinish(conn);
+        return false;
+    }
+
+    struct json_object *update_obj, *db_obj;
+    if (!json_object_object_get_ex(metadata_json, "update", &update_obj) ||
+        !json_object_object_get_ex(metadata_json, "$db", &db_obj)) {
+        fprintf(stderr, "Invalid metadata JSON format\n");
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    const char *collection = json_object_get_string(update_obj);
+    const char *dbname = json_object_get_string(db_obj);
+
+    if (!check_and_create_database(conn, dbname)) {
+        fprintf(stderr, "Failed to create or check database\n");
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    PQfinish(conn);
+
+    char conninfo[BUFFER_SIZE];
+    snprintf(conninfo, sizeof(conninfo), "dbname=%s user=user1 password=passwd port=5433", dbname);
+    conn = PQconnectdb(conninfo);
+    if (PQstatus(conn) != CONNECTION_OK) {
+        fprintf(stderr, "Connection to database %s failed: %s", dbname, PQerrorMessage(conn));
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    if (!check_and_create_table(conn, collection)) {
+        fprintf(stderr, "Failed to create or check table\n");
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    struct json_object *update_array = json_tokener_parse(json_data_array);
+    if (!update_array || json_object_get_type(update_array) != json_type_array) {
+        fprintf(stderr, "Failed to parse update JSON array\n");
+        json_object_put(metadata_json);
+        PQfinish(conn);
+        return false;
+    }
+
+    if (!execute_update_queries(conn, collection, update_array)) {
+        fprintf(stderr, "Failed to execute update queries\n");
+        json_object_put(metadata_json);
+        json_object_put(update_array);
+        PQfinish(conn);
+        return false;
+    }
+
+    json_object_put(metadata_json);
+    json_object_put(update_array);
+    PQfinish(conn);
+
+    return true;
+}
+
+void process_message(uint32_t response_to, unsigned char *buffer,  char *json_metadata, char *json_data_array) {
 
     if (buffer[18] == 1) {
         flag = 1;
@@ -142,10 +627,16 @@ void process_message(uint32_t response_to, unsigned char *buffer, unsigned char 
         memset(buffer, 0, BUFFER_SIZE);
         return;
     }
-    const char *json_query = "{\"collection\": \"testcollection\", \"data\": {\"name\": \"example\"}}";
+
+    if (buffer[26] == 'e') {
+        flag = 5;
+        elog(WARNING, "end session");
+        memset(buffer, 0, BUFFER_SIZE);
+        return;
+    }
 
     if (buffer[26] == 'i') {
-        if (execute_query_to_postgres((const char *) json_query)) {
+        if (execute_query_insert_to_postgres(json_metadata, json_data_array)) {
             elog(WARNING, "Insert to PostgreSQL successful");
             flag = 3;
             memset(buffer, 0, BUFFER_SIZE);
@@ -153,6 +644,32 @@ void process_message(uint32_t response_to, unsigned char *buffer, unsigned char 
         } else {
             elog(WARNING, "Insert to PostgreSQL failed");
             flag = 4;
+            memset(buffer, 0, BUFFER_SIZE);
+            return;
+        }
+    }
+    if (buffer[26] == 'd') {
+        if (execute_query_delete_to_postgres(json_metadata, json_data_array)) {
+            elog(WARNING, "Delete from PostgreSQL successful");
+            flag = 6;
+            memset(buffer, 0, BUFFER_SIZE);
+            return;
+        } else {
+            elog(WARNING, "Delete from PostgreSQL failed");
+            flag = 7;
+            memset(buffer, 0, BUFFER_SIZE);
+            return;
+        }
+    }
+    if (buffer[26] == 'u') {
+        if (execute_query_update_to_postgres(json_metadata, json_data_array)) {
+            elog(WARNING, "Update from PostgreSQL successful");
+            flag = 8;
+            memset(buffer, 0, BUFFER_SIZE);
+            return;
+        } else {
+            elog(WARNING, "Update from PostgreSQL failed");
+            flag = 9;
             memset(buffer, 0, BUFFER_SIZE);
             return;
         }
@@ -195,16 +712,12 @@ int main_proxy(void) {
 
     ev_io_init(&w_accept, accept_cb, server_sd, EV_READ);
     ev_io_start(loop, &w_accept);
+    //ev_signal_init(&signal_watcher, handle_sigterm, SIGTERM);
+    //ev_signal_start(loop, &signal_watcher);
 
     ev_loop(loop, 0);
 
-    if (loop) {
-        ev_break(loop, EVBREAK_ALL);
-    }
-    if (server_sd >= 0) {
-        close(server_sd);
-    }
-    ev_loop_destroy(loop);
+    cleanup_and_exit(loop);
     return 0;
 }
 
@@ -232,7 +745,23 @@ void accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
 
     ev_io_init(w_client, read_cb, client_sd, EV_READ);
     ev_io_start(loop, w_client);
+
 }
+
+void cleanup_and_exit(struct ev_loop *loop) {
+    if (server_sd >= 0) {
+        close(server_sd);
+    }
+    ev_loop_destroy(loop);
+    exit(0);
+}
+
+/*
+void handle_sigterm(struct ev_loop *loop, ev_signal *w, int revents) {
+    elog(WARNING, "Received SIGTERM, shutting down...");
+    ev_break(loop, EVBREAK_ALL);
+}
+*/
 
 void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     unsigned char buffer[BUFFER_SIZE];
@@ -243,7 +772,7 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     u_int32_t msg_length = 0;
     u_int32_t request_id = 0;
     u_int32_t response_to = 0;
-    u_int32_t op_code = 0; 
+    u_int32_t op_code = 0;
 
 
     if (EV_ERROR & revents) {
@@ -251,7 +780,7 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
         return;
     }
 
-    
+
     read = recv(watcher->fd, buffer, BUFFER_SIZE, 0);
 
     if (read < 0) {
@@ -266,11 +795,16 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
         return;
     }
 
-/*
-    uint32_t message_length = ((uint32_t *) buffer)[0];
-    uint32_t request_id = ((uint32_t *) buffer)[1];
-    uint32_t response_to = ((uint32_t *) buffer)[2];
-    uint32_t op_code = ((uint32_t *) buffer)[3];
+    query_string = (char **) malloc(sizeof(char *));
+    parameter_string = (char **) malloc(sizeof(char *));
+    *query_string = NULL;
+    *parameter_string = NULL;
+
+
+    msg_length = ((u_int32_t *) buffer)[0];
+    request_id = ((u_int32_t *) buffer)[1];
+    response_to = ((u_int32_t *) buffer)[2];
+    op_code = ((u_int32_t *) buffer)[3];
 
     unsigned char response[] = "I\001\000\000~\001\000\000\003\000\000\000\001\000\000\000\b\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\001\000\000\000%\001\000\000\bhelloOk\000\001\bismaster\000\001\003topologyVersion\000-\000\000\000\aprocessId\000f\225\335\246B(\\C\202\2468\351\022counter\000\000\000\000\000\000\000\000\000\000\020maxBsonObjectSize\000\000\000\000\001\020maxMessageSizeBytes\000\000l\334\002\020maxWriteBatchSize\000\240\206\001\000\tlocalTime\000\032T\246\271\220\001\000\000\020logicalSessionTimeoutMinutes\000\036\000\000\000\020connectionId\000*\000\000\000\020minWireVersion\000\000\000\000\000\020maxWireVersion\000\025\000\000\000\breadOnly\000\000\001ok\000\000\000\000\000\000\000\360?";
     unsigned char msg_response[] = "&\000\000\000\006\000\000\000\001\000\000\000\335\a\000\000\000\000\000\000\000\021\000\000\000\001ok\000\000\000\000\000\000\000\360?";
@@ -278,60 +812,56 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
 
     switch (op_code) {
         case OP_QUERY:
+            //parse_query(buffer);
             elog(WARNING, "send reply");
             send(watcher->fd, response, sizeof(response), 0);
             break;
         case OP_MSG:
-            process_message(request_id, buffer, msg_response);
+            parse_message(buffer, query_string, parameter_string);
+            process_message(request_id, buffer, *query_string, *parameter_string);
             if (flag == 2) {
                 elog(WARNING, "send ping");
                 send(watcher->fd, msg_response, sizeof(msg_response), 0);
-            } else if (flag == 3) {
+            }
+            if (flag == 3) {
                 elog(WARNING, "send insert");
                 send(watcher->fd, ok_query_response, sizeof(ok_query_response), 0);
             }
+            if (flag == 6) {
+                elog(WARNING, "send delete");
+                send(watcher->fd, ok_query_response, sizeof(ok_query_response), 0);
+            }
+            if (flag == 8) {
+                elog(WARNING, "send update");
+                send(watcher->fd, ok_query_response, sizeof(ok_query_response), 0);
+            }
+            if (flag == 5) {
+                elog(WARNING, "terminate session");
+                send(watcher->fd, msg_response, sizeof(msg_response), 0);
+            }
+            break;
+        case OP_REPLY:
+            /* code */
             break;
         default:
-            elog(WARNING, "UNKNOWN OP_CODE :(");
+            perror("UNKNOWN OP_CODE\n");
+            return;
     }
+
     memset(buffer, 0, BUFFER_SIZE);
-    */
-
-
-
-    query_string = (char **) malloc(sizeof(char*));
-    parameter_string = (char **) malloc(sizeof(char*));
-
-
-       
-
-    msg_length = ((u_int32_t*)buffer)[0];
-    request_id = ((u_int32_t*)buffer)[1];
-    response_to = ((u_int32_t*)buffer)[2];
-    op_code = ((u_int32_t*)buffer)[3];    
-
-    switch (op_code) {
-    case OP_QUERY:
-        //parse_query(buffer);
-        break;
-    case OP_MSG:
-    
-        parse_message(buffer, query_string, parameter_string);
-        break;
-    case OP_REPLY:
-        /* code */
-        break;
-    default:
-        perror("UNKNOWN OP_CODE\n");
-        return;
+    if (*query_string != NULL) {
+        free(*query_string);
+    }
+    if (*parameter_string != NULL) {
+        free(*parameter_string);
+    }
+    if (query_string != NULL) {
+        free(query_string);
+    }
+    if (parameter_string != NULL) {
+        free(parameter_string);
     }
 
-
-    free(*query_string);
-    free(*parameter_string);
-    free(query_string);
-    free(parameter_string);
-   
 }
 
 void write_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
@@ -358,18 +888,15 @@ void _PG_init(void) {
     RegisterBackgroundWorker(&worker);
 }
 
-
-
-
 /**
  * return 0 if everything is successful
  * return -1 if not (for example, if smth with length of char *buffer)
  */
 int parse_message(char *buffer, char **query_string, char **parameter_string) {
-    u_int32_t flags = ((u_int32_t*)buffer)[4];
+    u_int32_t flags = ((u_int32_t *) buffer)[4];
     int overall_sections_start_bit = 20; //because of mongodb protocol
-    int overall_sections_end_bit = ((u_int32_t*)buffer)[0]; //msg_length
-    u_int32_t msg_length = ((u_int32_t*)buffer)[0]; //msg_length
+    int overall_sections_end_bit = ((u_int32_t *) buffer)[0]; //msg_length
+    u_int32_t msg_length = ((u_int32_t *) buffer)[0]; //msg_length
     u_int32_t checksum = 0;
     char section_kind = 0;
     bson_t *b[MAX_BSON_OBJECTS]; //array of *bson_t formed by parsing OP_MSG message type
@@ -379,73 +906,72 @@ int parse_message(char *buffer, char **query_string, char **parameter_string) {
     int par_string_len;
     int len_of_par_strings = 0;
     char **jsons;
-    
+
     if (flags && (1 << 7)) {
         overall_sections_end_bit -= 4; //it means there is a checksum in the end of the packet
         ///////////later : add buffersize <?> msg_length check
-        checksum = ((u_int32_t*)buffer)[msg_length / sizeof(u_int32_t) - 1]; //the checksum
+        checksum = ((u_int32_t *) buffer)[msg_length / sizeof(u_int32_t) - 1]; //the checksum
     }
 
 
     section_start = overall_sections_start_bit;
 
-    for (; section_start < overall_sections_end_bit;) { 
-        
+    for (; section_start < overall_sections_end_bit;) {
+
         int add_to_section_start = 0;
         section_kind = buffer[section_start];
-        section_start ++; //bc we got section kind
+        section_start++; //bc we got section kind
 
-        switch (section_kind)
-        {
-        case BODY_MSG_SECTION_TYPE:
-        /**
-         * A body section is encoded as a single BSON object. 
-         * The size in the BSON object also serves as the size of the section.
-         * */
-            int flag_local = parse_bson_object((buffer + section_start), &(b[next_bson_to_get]));
-            if (flag_local < 0) {
-                return -1; //it means smth bad with parsing bson
-            }
-
-            next_bson_to_get++;
-            add_to_section_start += ((u_int32_t*)(buffer + section_start))[0];
-            break;
-        case DOC_MSG_SECTION_TYPE:
-        /**
-         * A Document Sequence section contains:
-         * int32 - size of the section
-         * cstring - Document sequence identifier.
-         * Zero or more BSON objects
-         * */
-            u_int32_t size_section = ((u_int32_t*)(buffer + section_start))[0];
-            // YES, it starts with the section start, not by cstring start - look at func realization
-            ssize_t doc_string_len = get_str_len_from_doc_seq(buffer + section_start);
-            if (doc_string_len < 0) {
-                elog(ERROR, "UNKNOWN PROBLEM WITH STRING");
-                return -1; //it means smth wrong with string => smth wrong with buffer/packet
-            }
-
-            //this is wwhere bsons located
-            add_to_section_start += doc_string_len + 4; //size of the string + size of the section
-            int j = 0;
-            for (j = section_start + add_to_section_start; j < section_start + size_section; ) {
-                u_int32_t my_bson_size = ((u_int32_t*)(buffer + j))[0];
-                int flag_local = parse_bson_object((char *)(buffer + j), &(b[next_bson_to_get]));
+        switch (section_kind) {
+            case BODY_MSG_SECTION_TYPE:
+                /**
+                 * A body section is encoded as a single BSON object.
+                 * The size in the BSON object also serves as the size of the section.
+                 * */
+                int flag_local = parse_bson_object((buffer + section_start), &(b[next_bson_to_get]));
                 if (flag_local < 0) {
-                    elog(ERROR, "PROBLEMS WITH PARSING BSON\n");
                     return -1; //it means smth bad with parsing bson
                 }
-                
+
                 next_bson_to_get++;
-                j += my_bson_size;
-            }
-            add_to_section_start = j - section_start;
-            break;
-        
-        default:
-            elog(ERROR, "UNKNOWN SECTION KIND: %d\n", section_kind);
-            return -1;
-            break;
+                add_to_section_start += ((u_int32_t * )(buffer + section_start))[0];
+                break;
+            case DOC_MSG_SECTION_TYPE:
+                /**
+                 * A Document Sequence section contains:
+                 * int32 - size of the section
+                 * cstring - Document sequence identifier.
+                 * Zero or more BSON objects
+                 * */
+                u_int32_t size_section = ((u_int32_t * )(buffer + section_start))[0];
+                // YES, it starts with the section start, not by cstring start - look at func realization
+                ssize_t doc_string_len = get_str_len_from_doc_seq(buffer + section_start);
+                if (doc_string_len < 0) {
+                    elog(ERROR, "UNKNOWN PROBLEM WITH STRING");
+                    return -1; //it means smth wrong with string => smth wrong with buffer/packet
+                }
+
+                //this is wwhere bsons located
+                add_to_section_start += doc_string_len + 4; //size of the string + size of the section
+                int j = 0;
+                for (j = section_start + add_to_section_start; j < section_start + size_section;) {
+                    u_int32_t my_bson_size = ((u_int32_t * )(buffer + j))[0];
+                    int flag_local = parse_bson_object((char *) (buffer + j), &(b[next_bson_to_get]));
+                    if (flag_local < 0) {
+                        elog(ERROR, "PROBLEMS WITH PARSING BSON\n");
+                        return -1; //it means smth bad with parsing bson
+                    }
+
+                    next_bson_to_get++;
+                    j += my_bson_size;
+                }
+                add_to_section_start = j - section_start;
+                break;
+
+            default:
+                elog(ERROR, "UNKNOWN SECTION KIND: %d\n", section_kind);
+                return -1;
+                break;
         }
 
 
@@ -459,20 +985,19 @@ int parse_message(char *buffer, char **query_string, char **parameter_string) {
     }
 
     size_t len_of_string = 0;
-    char *str = bson_as_relaxed_extended_json (b[0], &len_of_string);
+    char *str = bson_as_relaxed_extended_json(b[0], &len_of_string);
     *query_string = (char *) malloc(len_of_string + 1);
     memset(*query_string, 0, len_of_string + 1);
     memcpy(*query_string, str, len_of_string);
-    bson_free (str);
+    bson_free(str);
 
-    
 
-    jsons = (char **)malloc((next_bson_to_get - 1) * sizeof(char *));
+    jsons = (char **) malloc((next_bson_to_get - 1) * sizeof(char *));
 
 
     for (int i = 1; i < next_bson_to_get; ++i) {
         size_t len_of_string = 0;
-        jsons[i] = bson_as_relaxed_extended_json (b[i], &len_of_string);
+        jsons[i] = bson_as_relaxed_extended_json(b[i], &len_of_string);
 
         len_of_par_strings += len_of_string;
     }
@@ -489,16 +1014,16 @@ int parse_message(char *buffer, char **query_string, char **parameter_string) {
         now += 1;
 
         for (int i = 1; i < next_bson_to_get; ++i) {
-            if (i +1 != next_bson_to_get) {
+            if (i + 1 != next_bson_to_get) {
 
-                memcpy((char *)(*parameter_string + now), jsons[i], strlen(jsons[i]));
+                memcpy((char *) (*parameter_string + now), jsons[i], strlen(jsons[i]));
                 now += strlen(jsons[i]);
-                memcpy((char *)(*parameter_string + now), ", ", 2);
+                memcpy((char *) (*parameter_string + now), ", ", 2);
                 now += 2;
             } else {
-                memcpy((char *)(*parameter_string + now), jsons[i], strlen(jsons[i]));
+                memcpy((char *) (*parameter_string + now), jsons[i], strlen(jsons[i]));
                 now += strlen(jsons[i]);
-                memcpy((char *)(*parameter_string + now), "]", 1);
+                memcpy((char *) (*parameter_string + now), "]", 1);
                 now += 1;
             }
         }
@@ -521,8 +1046,8 @@ int parse_message(char *buffer, char **query_string, char **parameter_string) {
  * return -1 if not (espesially if smth with length of char *my_data)
  */
 int parse_bson_object(char *my_data, bson_t **my_bson) {
-    size_t my_data_len = ((u_int32_t*)my_data)[0];
-    *my_bson = bson_new_from_data (my_data, my_data_len);
+    size_t my_data_len = ((u_int32_t *) my_data)[0];
+    *my_bson = bson_new_from_data(my_data, my_data_len);
     if (!my_bson) {
         return -1;
     }
@@ -535,10 +1060,10 @@ int parse_bson_object(char *my_data, bson_t **my_bson) {
  * else return -1
  */
 ssize_t get_str_len_from_doc_seq(char *doc_seq) {
-    u_int32_t section_size = ((u_int32_t*)doc_seq)[0];
+    u_int32_t section_size = ((u_int32_t *) doc_seq)[0];
     ssize_t count = 0;
 
-    for (int i = 4; i < (int)section_size; ++i) {
+    for (int i = 4; i < (int) section_size; ++i) {
         if (doc_seq[i] == '\0') {
             count++;
             return count;
