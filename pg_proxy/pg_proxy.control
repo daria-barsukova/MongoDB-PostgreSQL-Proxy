@@ -1,0 +1,5 @@
+# pg_proxy extension
+comment = 'learn new stuff about pg extensions'
+default_version = '1.0'
+module_pathname = '$libdir/pg_proxy'
+relocatable = true

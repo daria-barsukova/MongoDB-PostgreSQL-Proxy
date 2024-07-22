@@ -1,0 +1,2 @@
+--CREATE FUNCTION main() RETURNS void
+--AS 'MODULE_PATHNAME', 'tcp_echo_main' LANGUAGE C STRICT;
