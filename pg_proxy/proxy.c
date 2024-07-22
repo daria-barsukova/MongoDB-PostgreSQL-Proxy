@@ -40,7 +40,7 @@ PGDLLEXPORT int main_proxy(void);
 void accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents);
 void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents);
 void write_cb(struct ev_loop *loop, struct ev_io *watcher, int revents);
-void process_message(uint32_t response_to, unsigned char *buffer, char *json_metadata,char *json_data_array);
+void process_message(uint32_t response_to, unsigned char *buffer, char *json_metadata,char *json_data_array, int *flag);
 void parse_mongodb_packet(char *buffer, char **query_string, char **parameter_string);
 int parse_message(char *buffer, char **query_string, char **parameter_string);
 int parse_bson_object(char *my_data, bson_t **my_bson);
@@ -63,7 +63,7 @@ void modify_ping_endsessions_reply(unsigned char *reply, u_int32_t response_to);
 void modify_update_reply(unsigned char *reply, u_int32_t response_to, int nmodified);
 
 
-int flag = 0;
+//int flag = 0;
 int server_sd = -1;
 
 static void handle_sigterm(SIGNAL_ARGS) {
@@ -806,17 +806,17 @@ bool execute_query_find_to_postgres(const char *json_metadata, struct json_objec
 }
 
 
-void process_message(uint32_t response_to, unsigned char *buffer,  char *json_metadata, char *json_data_array) {
+void process_message(uint32_t response_to, unsigned char *buffer,  char *json_metadata, char *json_data_array, int *flag) {
 
     if (buffer[18] == 1) {
-        flag = 1;
+        *flag = 1;
         elog(WARNING, "ignore");
         memset(buffer, 0, BUFFER_SIZE);
         return;
     }
 
     if (buffer[26] == 'h') {
-        flag = 1;
+        *flag = 1;
         elog(WARNING, "ignore");
         memset(buffer, 0, BUFFER_SIZE);
         return;
@@ -824,14 +824,14 @@ void process_message(uint32_t response_to, unsigned char *buffer,  char *json_me
 
     elog(WARNING, "before ping check");
     if (buffer[26] == 'p') {
-        flag = 2;
+        *flag = 2;
         elog(WARNING, "ping");
         memset(buffer, 0, BUFFER_SIZE);
         return;
     }
 
     if (buffer[26] == 'e') {
-        flag = 5;
+        *flag = 5;
         elog(WARNING, "end session");
         memset(buffer, 0, BUFFER_SIZE);
         return;
@@ -841,12 +841,12 @@ void process_message(uint32_t response_to, unsigned char *buffer,  char *json_me
         int inserted_count = 0;
         if (execute_query_insert_to_postgres(json_metadata, json_data_array, &inserted_count)) {
             elog(WARNING, "Insert to PostgreSQL successful %d", inserted_count);
-            flag = 3;
+            *flag = 3;
             memset(buffer, 0, BUFFER_SIZE);
             return;
         } else {
             elog(WARNING, "Insert to PostgreSQL failed");
-            flag = 4;
+            *flag = 4;
             memset(buffer, 0, BUFFER_SIZE);
             return;
         }
@@ -855,12 +855,12 @@ void process_message(uint32_t response_to, unsigned char *buffer,  char *json_me
         int deleted_count = 0;
         if (execute_query_delete_to_postgres(json_metadata, json_data_array, &deleted_count)) {
             elog(WARNING, "Delete from PostgreSQL successful %d", deleted_count);
-            flag = 6;
+            *flag = 6;
             memset(buffer, 0, BUFFER_SIZE);
             return;
         } else {
             elog(WARNING, "Delete from PostgreSQL failed");
-            flag = 7;
+            *flag = 7;
             memset(buffer, 0, BUFFER_SIZE);
             return;
         }
@@ -869,12 +869,12 @@ void process_message(uint32_t response_to, unsigned char *buffer,  char *json_me
         int updated_count = 0;
         if (execute_query_update_to_postgres(json_metadata, json_data_array, &updated_count)) {
             elog(WARNING, "Update from PostgreSQL successful %d", updated_count);
-            flag = 8;
+            *flag = 8;
             memset(buffer, 0, BUFFER_SIZE);
             return;
         } else {
             elog(WARNING, "Update from PostgreSQL failed");
-            flag = 9;
+            *flag = 9;
             memset(buffer, 0, BUFFER_SIZE);
             return;
         }
@@ -882,7 +882,7 @@ void process_message(uint32_t response_to, unsigned char *buffer,  char *json_me
     if (buffer[26] == 'f') {
         struct json_object *results;
         if (execute_query_find_to_postgres(json_metadata, &results)) {
-            flag = 10;
+            *flag = 10;
             fprintf(stderr, "Find query executed successfully. Results:\n%s\n", json_object_to_json_string_ext(results, JSON_C_TO_STRING_PRETTY));
         } else {
             fprintf(stderr, "Failed to execute find query\n");
@@ -990,6 +990,7 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     u_int32_t request_id = 0;
     u_int32_t response_to = 0;
     u_int32_t op_code = 0;
+    int flag = 0;
 
     unsigned char insert_delete_ok[INSERT_DELETE_REPLY_LEN] = "-\000\000\000\213\003\000\000\t\000\000\000\335\a\000"
     "\000\000\000\000\000\000\030\000\000\000\020n\000\002\000\000\000\001ok\000\000\000\000\000\000\000\360?\000";
@@ -1046,11 +1047,11 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
             break;
         case OP_MSG:
             parse_message(buffer, query_string, parameter_string);
-            process_message(request_id, buffer, *query_string, *parameter_string);
+            process_message(request_id, buffer, *query_string, *parameter_string, &flag);
             if (flag == 2) {
                 elog(WARNING, "send ping");
                 //REPLY MODIFIED
-                modify_ping_endsessions_reply(&ping_endsessions_ok, response_to);
+                modify_ping_endsessions_reply(&ping_endsessions_ok, request_id);
                 //send(watcher->fd, msg_response, sizeof(msg_response), 0);
                 send(watcher->fd, ping_endsessions_ok, PING_ENDSESSIONS_REPLY_LEN, 0);
             }
@@ -1074,7 +1075,7 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
             if (flag == 5) {
                 elog(WARNING, "terminate session");
                 //REPLY MODIFIED
-                modify_ping_endsessions_reply(&ping_endsessions_ok, response_to);
+                modify_ping_endsessions_reply(&ping_endsessions_ok, request_id);
                 //send(watcher->fd, msg_response, sizeof(msg_response), 0);
                 send(watcher->fd, ping_endsessions_ok, PING_ENDSESSIONS_REPLY_LEN, 0);
             }
