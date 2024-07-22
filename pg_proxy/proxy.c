@@ -17,7 +17,7 @@
 PG_MODULE_MAGIC;
 #endif
 
-#define MONGO_PORT 5025
+#define MONGO_PORT 5013
 #define BUFFER_SIZE 1024
 #define OP_QUERY 2004
 #define OP_REPLY 1
@@ -45,12 +45,12 @@ bool check_and_create_database(PGconn *conn, const char *dbname);
 bool check_and_create_table(PGconn *conn, const char *table_name);
 bool check_and_create_columns(PGconn *conn, const char *table_name, struct json_object *data_json);
 const char *get_json_value_as_string(struct json_object *field_value);
-bool execute_insert_queries(PGconn *conn, const char *table_name, struct json_object *data_array);
-bool execute_query_insert_to_postgres(const char *json_metadata, const char *json_data_array);
-bool execute_delete_queries(PGconn *conn, const char *table_name, struct json_object *delete_array);
-bool execute_query_delete_to_postgres(const char *json_metadata, const char *json_data_array);
-bool execute_update_queries(PGconn *conn, const char *table_name, struct json_object *update_array);
-bool execute_query_update_to_postgres(const char *json_metadata, const char *json_data_array);
+bool execute_insert_queries(PGconn *conn, const char *table_name, struct json_object *data_array, int *inserted_count);
+bool execute_query_insert_to_postgres(const char *json_metadata, const char *json_data_array, int *inserted_count);
+bool execute_delete_queries(PGconn *conn, const char *table_name, struct json_object *delete_array, int* deleted_count);
+bool execute_query_delete_to_postgres(const char *json_metadata, const char *json_data_array, int* deleted_count);
+bool execute_update_queries(PGconn *conn, const char *table_name, struct json_object *update_array, int* updated_count);
+bool execute_query_update_to_postgres(const char *json_metadata, const char *json_data_array, int* updated_count);
 void cleanup_and_exit(struct ev_loop *loop);
 static void handle_sigterm(SIGNAL_ARGS);
 
@@ -124,40 +124,42 @@ bool check_and_create_columns(PGconn *conn, const char *table_name, struct json_
             json_object_iter_next(&it);
             continue;
         }
+        if (strcmp(field_name, "q") != 0 && strcmp(field_name, "u") != 0 && strcmp(field_name, "multi") != 0) {
 
-        char query[BUFFER_SIZE];
-        snprintf(query, sizeof(query),
-                 "SELECT 1 FROM information_schema.columns WHERE table_name='%s' AND column_name='%s'", table_name,
-                 field_name);
+            char query[BUFFER_SIZE];
+            snprintf(query, sizeof(query),
+                     "SELECT 1 FROM information_schema.columns WHERE table_name='%s' AND column_name='%s'", table_name,
+                     field_name);
 
-        PGresult *res = PQexec(conn, query);
-        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-            PQclear(res);
-            return false;
-        }
-
-        if (PQntuples(res) == 0) {
-            PQclear(res);
-            // Determine type of field from JSON object
-            struct json_object *field_value = json_object_iter_peek_value(&it);
-            const char *field_type = "TEXT";
-            if (json_object_is_type(field_value, json_type_int)) {
-                field_type = "INT";
-            } else if (json_object_is_type(field_value, json_type_boolean)) {
-                field_type = "BOOLEAN";
-            } else if (json_object_is_type(field_value, json_type_double)) {
-                field_type = "DOUBLE PRECISION";
-            }
-
-            snprintf(query, sizeof(query), "ALTER TABLE %s ADD COLUMN %s %s", table_name, field_name, field_type);
-            res = PQexec(conn, query);
-            if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+            PGresult *res = PQexec(conn, query);
+            if (PQresultStatus(res) != PGRES_TUPLES_OK) {
                 PQclear(res);
                 return false;
             }
-        }
 
-        PQclear(res);
+            if (PQntuples(res) == 0) {
+                PQclear(res);
+                // Determine type of field from JSON object
+                struct json_object *field_value = json_object_iter_peek_value(&it);
+                const char *field_type = "TEXT";
+                if (json_object_is_type(field_value, json_type_int)) {
+                    field_type = "INT";
+                } else if (json_object_is_type(field_value, json_type_boolean)) {
+                    field_type = "BOOLEAN";
+                } else if (json_object_is_type(field_value, json_type_double)) {
+                    field_type = "DOUBLE PRECISION";
+                }
+
+                snprintf(query, sizeof(query), "ALTER TABLE %s ADD COLUMN %s %s", table_name, field_name, field_type);
+                res = PQexec(conn, query);
+                if (PQresultStatus(res) != PGRES_COMMAND_OK) {
+                    PQclear(res);
+                    return false;
+                }
+            }
+
+            PQclear(res);
+        }
         json_object_iter_next(&it);
     }
 
@@ -177,8 +179,9 @@ const char *get_json_value_as_string(struct json_object *field_value) {
     return NULL;
 }
 
-bool execute_insert_queries(PGconn *conn, const char *table_name, struct json_object *data_array) {
+bool execute_insert_queries(PGconn *conn, const char *table_name, struct json_object *data_array, int *inserted_count) {
     int array_length = json_object_array_length(data_array);
+    *inserted_count = 0;
     for (int i = 0; i < array_length; i++) {
         struct json_object *data_json = json_object_array_get_idx(data_array, i);
 
@@ -232,12 +235,13 @@ bool execute_insert_queries(PGconn *conn, const char *table_name, struct json_ob
             PQclear(res);
             return false;
         }
+        (*inserted_count)++;
         PQclear(res);
     }
     return true;
 }
 
-bool execute_query_insert_to_postgres(const char *json_metadata, const char *json_data_array) {
+bool execute_query_insert_to_postgres(const char *json_metadata, const char *json_data_array, int *inserted_count) {
     // Connect to database
     PGconn *conn = PQconnectdb(PG_CONNINFO);
     if (PQstatus(conn) != CONNECTION_OK) {
@@ -305,7 +309,7 @@ bool execute_query_insert_to_postgres(const char *json_metadata, const char *jso
     }
 
     // Execute insert queries
-    if (!execute_insert_queries(conn, collection, data_array)) {
+    if (!execute_insert_queries(conn, collection, data_array, inserted_count)) {
         fprintf(stderr, "Failed to execute insert queries\n");
         json_object_put(metadata_json);
         json_object_put(data_array);
@@ -321,8 +325,26 @@ bool execute_query_insert_to_postgres(const char *json_metadata, const char *jso
     return true;
 }
 
-bool execute_delete_queries(PGconn *conn, const char *table_name, struct json_object *delete_array) {
+bool column_exists(PGconn *conn, const char *table_name, const char *column_name) {
+    char query[BUFFER_SIZE];
+    snprintf(query, sizeof(query),
+             "SELECT column_name FROM information_schema.columns WHERE table_name='%s' AND column_name='%s'",
+             table_name, column_name);
+
+    PGresult *res = PQexec(conn, query);
+    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        PQclear(res);
+        return false;
+    }
+
+    bool exists = PQntuples(res) > 0;
+    PQclear(res);
+    return exists;
+}
+
+bool execute_delete_queries(PGconn *conn, const char *table_name, struct json_object *delete_array, int* deleted_count) {
     int array_length = json_object_array_length(delete_array);
+    *deleted_count = 0;
     for (int i = 0; i < array_length; i++) {
         struct json_object *delete_json = json_object_array_get_idx(delete_array, i);
         struct json_object *q_json, *limit_json;
@@ -340,6 +362,12 @@ bool execute_delete_queries(PGconn *conn, const char *table_name, struct json_ob
         while (!json_object_iter_equal(&it, &it_end)) {
             const char *field_name = json_object_iter_peek_name(&it);
             struct json_object *field_value = json_object_iter_peek_value(&it);
+
+            if (!column_exists(conn, table_name, field_name)) {
+                fprintf(stderr, "Column '%s' does not exist in table '%s'\n", field_name, table_name);
+                return true;  // Return 0 deleted rows
+            }
+
             const char *value_str = json_object_get_string(field_value);
 
             strcat(condition, field_name);
@@ -369,12 +397,13 @@ bool execute_delete_queries(PGconn *conn, const char *table_name, struct json_ob
             PQclear(res);
             return false;
         }
+        *deleted_count += atoi(PQcmdTuples(res));
         PQclear(res);
     }
     return true;
 }
 
-bool execute_query_delete_to_postgres(const char *json_metadata, const char *json_data_array) {
+bool execute_query_delete_to_postgres(const char *json_metadata, const char *json_data_array, int* deleted_count) {
     PGconn *conn = PQconnectdb(PG_CONNINFO);
     if (PQstatus(conn) != CONNECTION_OK) {
         fprintf(stderr, "Connection to database failed: %s", PQerrorMessage(conn));
@@ -435,7 +464,7 @@ bool execute_query_delete_to_postgres(const char *json_metadata, const char *jso
         return false;
     }
 
-    if (!execute_delete_queries(conn, collection, delete_array)) {
+    if (!execute_delete_queries(conn, collection, delete_array, deleted_count)) {
         fprintf(stderr, "Failed to execute delete queries\n");
         json_object_put(metadata_json);
         json_object_put(delete_array);
@@ -450,11 +479,17 @@ bool execute_query_delete_to_postgres(const char *json_metadata, const char *jso
     return true;
 }
 
-bool execute_update_queries(PGconn *conn, const char *table_name, struct json_object *update_array) {
+bool execute_update_queries(PGconn *conn, const char *table_name, struct json_object *update_array, int* updated_count) {
     int array_length = json_object_array_length(update_array);
+    *updated_count = 0;
     for (int i = 0; i < array_length; i++) {
         struct json_object *update_json = json_object_array_get_idx(update_array, i);
         struct json_object *q_json, *u_json, *multi_json;
+
+        if (!check_and_create_columns(conn, table_name, update_json)) {
+            fprintf(stderr, "Failed to check and create columns\n");
+            return false;
+        }
 
         if (!json_object_object_get_ex(update_json, "q", &q_json) ||
             !json_object_object_get_ex(update_json, "u", &u_json)) {
@@ -487,7 +522,10 @@ bool execute_update_queries(PGconn *conn, const char *table_name, struct json_ob
             fprintf(stderr, "Invalid update JSON format\n");
             return false;
         }
-
+        if (!check_and_create_columns(conn, table_name, set_json)) {
+            fprintf(stderr, "Failed to check or create columns for update\n");
+            return false;
+        }
         it = json_object_iter_begin(set_json);
         it_end = json_object_iter_end(set_json);
         char set_clause[BUFFER_SIZE] = "";
@@ -523,12 +561,13 @@ bool execute_update_queries(PGconn *conn, const char *table_name, struct json_ob
             PQclear(res);
             return false;
         }
+        *updated_count += atoi(PQcmdTuples(res));
         PQclear(res);
     }
     return true;
 }
 
-bool execute_query_update_to_postgres(const char *json_metadata, const char *json_data_array) {
+bool execute_query_update_to_postgres(const char *json_metadata, const char *json_data_array,int* updated_count) {
     PGconn *conn = PQconnectdb(PG_CONNINFO);
     if (PQstatus(conn) != CONNECTION_OK) {
         fprintf(stderr, "Connection to database failed: %s", PQerrorMessage(conn));
@@ -589,7 +628,7 @@ bool execute_query_update_to_postgres(const char *json_metadata, const char *jso
         return false;
     }
 
-    if (!execute_update_queries(conn, collection, update_array)) {
+    if (!execute_update_queries(conn, collection, update_array, updated_count)) {
         fprintf(stderr, "Failed to execute update queries\n");
         json_object_put(metadata_json);
         json_object_put(update_array);
@@ -636,8 +675,9 @@ void process_message(uint32_t response_to, unsigned char *buffer,  char *json_me
     }
 
     if (buffer[26] == 'i') {
-        if (execute_query_insert_to_postgres(json_metadata, json_data_array)) {
-            elog(WARNING, "Insert to PostgreSQL successful");
+        int inserted_count = 0;
+        if (execute_query_insert_to_postgres(json_metadata, json_data_array, &inserted_count)) {
+            elog(WARNING, "Insert to PostgreSQL successful %d", inserted_count);
             flag = 3;
             memset(buffer, 0, BUFFER_SIZE);
             return;
@@ -649,8 +689,9 @@ void process_message(uint32_t response_to, unsigned char *buffer,  char *json_me
         }
     }
     if (buffer[26] == 'd') {
-        if (execute_query_delete_to_postgres(json_metadata, json_data_array)) {
-            elog(WARNING, "Delete from PostgreSQL successful");
+        int deleted_count = 0;
+        if (execute_query_delete_to_postgres(json_metadata, json_data_array, &deleted_count)) {
+            elog(WARNING, "Delete from PostgreSQL successful %d", deleted_count);
             flag = 6;
             memset(buffer, 0, BUFFER_SIZE);
             return;
@@ -662,8 +703,9 @@ void process_message(uint32_t response_to, unsigned char *buffer,  char *json_me
         }
     }
     if (buffer[26] == 'u') {
-        if (execute_query_update_to_postgres(json_metadata, json_data_array)) {
-            elog(WARNING, "Update from PostgreSQL successful");
+        int updated_count = 0;
+        if (execute_query_update_to_postgres(json_metadata, json_data_array, &updated_count)) {
+            elog(WARNING, "Update from PostgreSQL successful %d", updated_count);
             flag = 8;
             memset(buffer, 0, BUFFER_SIZE);
             return;
