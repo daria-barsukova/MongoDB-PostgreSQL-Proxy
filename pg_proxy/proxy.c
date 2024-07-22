@@ -22,7 +22,11 @@ PG_MODULE_MAGIC;
 #define OP_QUERY 2004
 #define OP_REPLY 1
 #define OP_MSG 2013
+#define PING_ENDSESSIONS_REPLY_LEN 38
+#define INSERT_DELETE_REPLY_LEN 45
+#define UPDATE_REPLY_LEN 60
 #define PG_CONNINFO "dbname=postgres user=user1 password=passwd host=localhost port=5433"
+
 
 
 #define BODY_MSG_SECTION_TYPE 0
@@ -53,6 +57,11 @@ bool execute_update_queries(PGconn *conn, const char *table_name, struct json_ob
 bool execute_query_update_to_postgres(const char *json_metadata, const char *json_data_array, int* updated_count);
 void cleanup_and_exit(struct ev_loop *loop);
 static void handle_sigterm(SIGNAL_ARGS);
+void random_new_req_id(unsigned char *buffer);
+void modify_insert_delete_reply(unsigned char *reply, u_int32_t response_to, int n);
+void modify_ping_endsessions_reply(unsigned char *reply, u_int32_t response_to);
+void modify_update_reply(unsigned char *reply, u_int32_t response_to, int nmodified);
+
 
 int flag = 0;
 int server_sd = -1;
@@ -982,6 +991,17 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     u_int32_t response_to = 0;
     u_int32_t op_code = 0;
 
+    unsigned char insert_delete_ok[INSERT_DELETE_REPLY_LEN] = "-\000\000\000\213\003\000\000\t\000\000\000\335\a\000"
+    "\000\000\000\000\000\000\030\000\000\000\020n\000\002\000\000\000\001ok\000\000\000\000\000\000\000\360?\000";
+
+    unsigned char ping_endsessions_ok[PING_ENDSESSIONS_REPLY_LEN] = "&\000\000\000\216\003\000\000\f\000\000\000"
+    "\335\a\000\000\000\000\000\000\000\021\000\000\000\001ok\000\000\000\000\000\000\000\360?\000";
+
+    unsigned char update_ok[UPDATE_REPLY_LEN] = "<\000\000\000\376\000\000\000\f\000\000\000\335\a\000\000\000\000"
+    "\000\000\000'\000\000\000\020n\000\001\000\000\000\020nModified\000\001\000\000\000\001ok\000\000\000\000\000"
+    "\000\000\360?\000";
+
+
 
     if (EV_ERROR & revents) {
         perror("got invalid event");
@@ -1029,7 +1049,10 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
             process_message(request_id, buffer, *query_string, *parameter_string);
             if (flag == 2) {
                 elog(WARNING, "send ping");
-                send(watcher->fd, msg_response, sizeof(msg_response), 0);
+                //REPLY MODIFIED
+                modify_ping_endsessions_reply(&ping_endsessions_ok, response_to);
+                //send(watcher->fd, msg_response, sizeof(msg_response), 0);
+                send(watcher->fd, ping_endsessions_ok, PING_ENDSESSIONS_REPLY_LEN, 0);
             }
             if (flag == 3) {
                 elog(WARNING, "send insert");
@@ -1041,6 +1064,7 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
             }
             if (flag == 8) {
                 elog(WARNING, "send update");
+                //modify_update_reply(&update_ok[0], response_to, )
                 send(watcher->fd, ok_query_response, sizeof(ok_query_response), 0);
             }
             if (flag == 10) {
@@ -1049,7 +1073,10 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
             }
             if (flag == 5) {
                 elog(WARNING, "terminate session");
-                send(watcher->fd, msg_response, sizeof(msg_response), 0);
+                //REPLY MODIFIED
+                modify_ping_endsessions_reply(&ping_endsessions_ok, response_to);
+                //send(watcher->fd, msg_response, sizeof(msg_response), 0);
+                send(watcher->fd, ping_endsessions_ok, PING_ENDSESSIONS_REPLY_LEN, 0);
             }
             break;
         case OP_REPLY:
@@ -1285,3 +1312,30 @@ ssize_t get_str_len_from_doc_seq(char *doc_seq) {
 
     return -1;
 }
+
+
+void random_new_req_id(unsigned char *buffer) {
+    static u_int32_t a = 911;
+    ((u_int32_t*)buffer)[1] = a;
+    a +=2;
+}
+
+void modify_insert_delete_reply(unsigned char *reply, u_int32_t response_to, int n) {
+    random_new_req_id(reply);
+    ((u_int32_t*)reply)[2] = response_to;
+    ((u_int32_t*)reply)[7] = (u_int32_t) n; // 7 because of mongodb protocol
+
+}
+
+void modify_ping_endsessions_reply(unsigned char *reply, u_int32_t response_to) {
+    random_new_req_id(reply);
+    ((u_int32_t*)reply)[2] = response_to;
+}
+
+void modify_update_reply(unsigned char *reply, u_int32_t response_to, int nmodified) {
+    random_new_req_id(reply);
+    ((u_int32_t*)reply)[2] = response_to;
+    ((u_int32_t*)(reply + 3))[(43 - 3) / 4] = nmodified;
+}
+
+
