@@ -42,10 +42,14 @@ void accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents);
 void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents);
 
 void write_cb(struct ev_loop *loop, struct ev_io *watcher, int revents);
+<<<<<<< HEAD
 
 void
 process_message(uint32_t response_to, unsigned char *buffer, char *json_metadata, char *json_data_array, int *flag);
 
+=======
+void process_message(uint32_t response_to, unsigned char *buffer, char *json_metadata,char *json_data_array, int *flag);
+>>>>>>> e817261513736846ff601f158e3406637015107d
 void parse_mongodb_packet(char *buffer, char **query_string, char **parameter_string);
 
 int parse_message(char *buffer, char **query_string, char **parameter_string);
@@ -95,7 +99,11 @@ void modify_update_reply(unsigned char *reply, u_int32_t response_to, int nmodif
 
 
 //int flag = 0;
+<<<<<<< HEAD
 //int server_sd = -1;
+=======
+int server_sd = -1;
+>>>>>>> e817261513736846ff601f158e3406637015107d
 
 void handle_sigterm(int signum, int server_sd) {
     cleanup_and_exit(ev_default_loop(0), server_sd);
@@ -882,8 +890,12 @@ bool execute_query_find_to_postgres(const char *json_metadata, struct json_objec
 }
 
 
+<<<<<<< HEAD
 void
 process_message(uint32_t response_to, unsigned char *buffer, char *json_metadata, char *json_data_array, int *flag) {
+=======
+void process_message(uint32_t response_to, unsigned char *buffer,  char *json_metadata, char *json_data_array, int *flag) {
+>>>>>>> e817261513736846ff601f158e3406637015107d
 
     if (buffer[18] == 1) {
         *flag = 1;
@@ -960,8 +972,12 @@ process_message(uint32_t response_to, unsigned char *buffer, char *json_metadata
         struct json_object *results;
         if (execute_query_find_to_postgres(json_metadata, &results)) {
             *flag = 10;
+<<<<<<< HEAD
             fprintf(stderr, "Find query executed successfully. Results:\n%s\n",
                     json_object_to_json_string_ext(results, JSON_C_TO_STRING_PRETTY));
+=======
+            fprintf(stderr, "Find query executed successfully. Results:\n%s\n", json_object_to_json_string_ext(results, JSON_C_TO_STRING_PRETTY));
+>>>>>>> e817261513736846ff601f158e3406637015107d
         } else {
             fprintf(stderr, "Failed to execute find query\n");
         }
@@ -1076,10 +1092,13 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     u_int32_t response_to = 0;
     u_int32_t op_code = 0;
     int flag = 0;
+<<<<<<< HEAD
 
     unsigned char response[] = "I\001\000\000~\001\000\000\003\000\000\000\001\000\000\000\b\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\001\000\000\000%\001\000\000\bhelloOk\000\001\bismaster\000\001\003topologyVersion\000-\000\000\000\aprocessId\000f\225\335\246B(\\C\202\2468\351\022counter\000\000\000\000\000\000\000\000\000\000\020maxBsonObjectSize\000\000\000\000\001\020maxMessageSizeBytes\000\000l\334\002\020maxWriteBatchSize\000\240\206\001\000\tlocalTime\000\032T\246\271\220\001\000\000\020logicalSessionTimeoutMinutes\000\036\000\000\000\020connectionId\000*\000\000\000\020minWireVersion\000\000\000\000\000\020maxWireVersion\000\025\000\000\000\breadOnly\000\000\001ok\000\000\000\000\000\000\000\360?";
     unsigned char msg_response[] = "&\000\000\000\006\000\000\000\001\000\000\000\335\a\000\000\000\000\000\000\000\021\000\000\000\001ok\000\000\000\000\000\000\000\360?";
     unsigned char ok_query_response[] = "-\000\000\000\a\000\000\000\t\000\000\000\335\a\000\000\000\000\000\000\000\030\000\000\000\020n\000\001\000\000\000\001ok\000\000\000\000\000\000\000\360?";
+=======
+>>>>>>> e817261513736846ff601f158e3406637015107d
 
     unsigned char insert_delete_ok[INSERT_DELETE_REPLY_LEN] = "-\000\000\000\213\003\000\000\t\000\000\000\335\a\000"
                                                               "\000\000\000\000\000\000\030\000\000\000\020n\000\002\000\000\000\001ok\000\000\000\000\000\000\000\360?\000";
