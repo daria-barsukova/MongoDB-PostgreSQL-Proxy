@@ -81,9 +81,9 @@ execute_find_query(PGconn *conn, const char *table_name, struct json_object *fin
 
 bool execute_query_find_to_postgres(const char *json_metadata, struct json_object **results);
 
-void cleanup_and_exit(struct ev_loop *loop);
+void cleanup_and_exit(struct ev_loop *loop, int server_sd);
 
-static void handle_sigterm(SIGNAL_ARGS);
+static void handle_sigterm(SIGNAL_ARGS, int server_sd);
 
 void random_new_req_id(unsigned char *buffer);
 
@@ -95,9 +95,9 @@ void modify_update_reply(unsigned char *reply, u_int32_t response_to, int nmodif
 
 
 //int flag = 0;
-int server_sd = -1;
+//int server_sd = -1;
 
-static void handle_sigterm(SIGNAL_ARGS) {
+static void handle_sigterm(SIGNAL_ARGS, int server_sd) {
     if (server_sd >= 0) {
         close(server_sd);
     }
@@ -935,7 +935,7 @@ int main_proxy(void) {
     int reuseaddr = 1;
     struct sockaddr_in addr;
     struct ev_io w_accept;
-
+    int server_sd = -1;
     if ((server_sd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("socket error");
         return -1;
@@ -971,7 +971,7 @@ int main_proxy(void) {
 
     ev_loop(loop, 0);
 
-    cleanup_and_exit(loop);
+    cleanup_and_exit(loop, server_sd);
     return 0;
 }
 
@@ -1002,7 +1002,7 @@ void accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
 
 }
 
-void cleanup_and_exit(struct ev_loop *loop) {
+void cleanup_and_exit(struct ev_loop *loop, int server_sd) {
     if (server_sd >= 0) {
         close(server_sd);
     }
