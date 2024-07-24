@@ -10,15 +10,18 @@
 #include "postmaster/bgworker.h"
 #include "fmgr.h"
 #include "postgresql/libpq-fe.h"
+#include "coro.h"
+#include "config.h"
 #include <json-c/json.h>
 #include <libbson-1.0/bson.h>
+#include "catalog/pg_type.h"
 
 #ifdef PG_MODULE_MAGIC
 
 PG_MODULE_MAGIC;
 #endif
 
-#define MONGO_PORT 5000
+#define MONGO_PORT 1110
 #define BUFFER_SIZE 1024
 #define OP_QUERY 2004
 #define OP_REPLY 1
@@ -28,6 +31,7 @@ PG_MODULE_MAGIC;
 #define UPDATE_REPLY_LEN 60
 #define PG_CONNINFO "dbname=postgres user=user1 password=passwd host=localhost port=5433"
 
+#define STACK_SIZE (1024 * 1024)  // 1 MB
 
 #define BODY_MSG_SECTION_TYPE 0
 #define DOC_MSG_SECTION_TYPE 1
@@ -96,6 +100,8 @@ void modify_update_reply(unsigned char *reply, u_int32_t response_to, int nmodif
 
 //int flag = 0;
 //int server_sd = -1;
+
+
 
 static void handle_sigterm(SIGNAL_ARGS, int server_sd) {
     if (server_sd >= 0) {
@@ -222,6 +228,7 @@ const char *get_json_value_as_string(struct json_object *field_value) {
 bool execute_insert_queries(PGconn *conn, const char *table_name, struct json_object *data_array, int *inserted_count) {
     int array_length = json_object_array_length(data_array);
     *inserted_count = 0;
+
     for (int i = 0; i < array_length; i++) {
         struct json_object *data_json = json_object_array_get_idx(data_array, i);
 
@@ -249,13 +256,22 @@ bool execute_insert_queries(PGconn *conn, const char *table_name, struct json_ob
             strcat(columns, field_name);
             strcat(columns, ",");
 
-            const char *value_str = get_json_value_as_string(field_value);
-            if (value_str) {
+            if (field_value == NULL || json_object_is_type(field_value, json_type_null)) {
+                strcat(values, "NULL");
+            } else if (json_object_is_type(field_value, json_type_boolean)) {
+                strcat(values, json_object_get_boolean(field_value) ? "TRUE" : "FALSE");
+            } else if (json_object_is_type(field_value, json_type_double)) {
+                snprintf(values + strlen(values), BUFFER_SIZE - strlen(values), "%f",
+                         json_object_get_double(field_value));
+            } else if (json_object_is_type(field_value, json_type_int)) {
+                snprintf(values + strlen(values), BUFFER_SIZE - strlen(values), "%lld",
+                         (long long int) json_object_get_int64(field_value));
+            } else if (json_object_is_type(field_value, json_type_string)) {
                 strcat(values, "'");
-                strcat(values, value_str);
+                strcat(values, json_object_get_string(field_value));
                 strcat(values, "'");
             } else {
-                strcat(values, "NULL");
+                strcat(values, "''");
             }
             strcat(values, ",");
 
@@ -524,6 +540,7 @@ bool
 execute_update_queries(PGconn *conn, const char *table_name, struct json_object *update_array, int *updated_count) {
     int array_length = json_object_array_length(update_array);
     *updated_count = 0;
+
     for (int i = 0; i < array_length; i++) {
         struct json_object *update_json = json_object_array_get_idx(update_array, i);
         struct json_object *q_json, *u_json, *multi_json;
@@ -546,12 +563,28 @@ execute_update_queries(PGconn *conn, const char *table_name, struct json_object 
         while (!json_object_iter_equal(&it, &it_end)) {
             const char *field_name = json_object_iter_peek_name(&it);
             struct json_object *field_value = json_object_iter_peek_value(&it);
-            const char *value_str = json_object_get_string(field_value);
 
             strcat(condition, field_name);
-            strcat(condition, "='");
-            strcat(condition, value_str);
-            strcat(condition, "' AND ");
+            strcat(condition, "=");
+
+            if (field_value == NULL || json_object_is_type(field_value, json_type_null)) {
+                strcat(condition, "NULL");
+            } else if (json_object_is_type(field_value, json_type_boolean)) {
+                strcat(condition, json_object_get_boolean(field_value) ? "TRUE" : "FALSE");
+            } else if (json_object_is_type(field_value, json_type_double)) {
+                snprintf(condition + strlen(condition), BUFFER_SIZE - strlen(condition), "%f",
+                         json_object_get_double(field_value));
+            } else if (json_object_is_type(field_value, json_type_int)) {
+                snprintf(condition + strlen(condition), BUFFER_SIZE - strlen(condition), "%lld",
+                         (long long int) json_object_get_int64(field_value));
+            } else if (json_object_is_type(field_value, json_type_string)) {
+                strcat(condition, "'");
+                strcat(condition, json_object_get_string(field_value));
+                strcat(condition, "'");
+            } else {
+                strcat(condition, "''");
+            }
+            strcat(condition, " AND ");
 
             json_object_iter_next(&it);
         }
@@ -564,10 +597,12 @@ execute_update_queries(PGconn *conn, const char *table_name, struct json_object 
             fprintf(stderr, "Invalid update JSON format\n");
             return false;
         }
+
         if (!check_and_create_columns(conn, table_name, set_json)) {
             fprintf(stderr, "Failed to check or create columns for update\n");
             return false;
         }
+
         it = json_object_iter_begin(set_json);
         it_end = json_object_iter_end(set_json);
         char set_clause[BUFFER_SIZE] = "";
@@ -575,12 +610,28 @@ execute_update_queries(PGconn *conn, const char *table_name, struct json_object 
         while (!json_object_iter_equal(&it, &it_end)) {
             const char *field_name = json_object_iter_peek_name(&it);
             struct json_object *field_value = json_object_iter_peek_value(&it);
-            const char *value_str = json_object_get_string(field_value);
 
             strcat(set_clause, field_name);
-            strcat(set_clause, "='");
-            strcat(set_clause, value_str);
-            strcat(set_clause, "', ");
+            strcat(set_clause, "=");
+
+            if (field_value == NULL || json_object_is_type(field_value, json_type_null)) {
+                strcat(set_clause, "NULL");
+            } else if (json_object_is_type(field_value, json_type_boolean)) {
+                strcat(set_clause, json_object_get_boolean(field_value) ? "TRUE" : "FALSE");
+            } else if (json_object_is_type(field_value, json_type_double)) {
+                snprintf(set_clause + strlen(set_clause), BUFFER_SIZE - strlen(set_clause), "%f",
+                         json_object_get_double(field_value));
+            } else if (json_object_is_type(field_value, json_type_int)) {
+                snprintf(set_clause + strlen(set_clause), BUFFER_SIZE - strlen(set_clause), "%lld",
+                         (long long int) json_object_get_int64(field_value));
+            } else if (json_object_is_type(field_value, json_type_string)) {
+                strcat(set_clause, "'");
+                strcat(set_clause, json_object_get_string(field_value));
+                strcat(set_clause, "'");
+            } else {
+                strcat(set_clause, "''");
+            }
+            strcat(set_clause, ", ");
 
             json_object_iter_next(&it);
         }
@@ -754,8 +805,35 @@ execute_find_query(PGconn *conn, const char *table_name, struct json_object *fin
 
         for (int j = 0; j < n_fields; j++) {
             const char *field_name = PQfname(res, j);
+            Oid field_type = PQftype(res, j);
             const char *field_value = PQgetvalue(res, i, j);
-            json_object_object_add(row_obj, field_name, json_object_new_string(field_value));
+
+            if (PQgetisnull(res, i, j)) {
+                json_object_object_add(row_obj, field_name, json_object_new_string(""));
+            } else {
+                switch (field_type) {
+                    case BOOLOID:
+                        json_object_object_add(row_obj, field_name, json_object_new_boolean(field_value[0] == 't'));
+                        break;
+                    case INT2OID:
+                    case INT4OID:
+                    case INT8OID:
+                        json_object_object_add(row_obj, field_name, json_object_new_int64(atoll(field_value)));
+                        break;
+                    case FLOAT4OID:
+                    case FLOAT8OID:
+                        json_object_object_add(row_obj, field_name, json_object_new_double(atof(field_value)));
+                        break;
+                    case TEXTOID:
+                    case VARCHAROID:
+                    case BPCHAROID:
+                        json_object_object_add(row_obj, field_name, json_object_new_string(field_value));
+                        break;
+                    default:
+                        json_object_object_add(row_obj, field_name, json_object_new_string(field_value));
+                        break;
+                }
+            }
         }
         json_object_array_add(*results, row_obj);
     }
@@ -930,6 +1008,52 @@ process_message(uint32_t response_to, unsigned char *buffer, char *json_metadata
     }
 }
 
+
+typedef struct {
+    struct ev_io io;
+    int fd;
+    coro_context ctx;
+    coro_context main_ctx;
+    char stack[STACK_SIZE];
+} client_t;
+
+
+void coroutine_entry_point(void *arg) {
+    client_t *client = (client_t *) arg;
+    struct ev_loop *loop = ev_default_loop(0);
+
+    ev_io_init(&client->io, read_cb, client->fd, EV_READ);
+    ev_io_start(loop, &client->io);
+
+    // Передаем управление обратно в главный контекст
+    coro_transfer(&client->ctx, &client->main_ctx);
+
+    // Запускаем цикл событий для обработки клиента
+    ev_run(loop, 0);
+
+    close(client->fd);
+    free(client);
+}
+
+void accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
+    if (revents & EV_ERROR) {
+        perror("got invalid event");
+        return;
+    }
+
+    int client_sd = accept(watcher->fd, NULL, NULL);
+    if (client_sd < 0) {
+        perror("accept error");
+        return;
+    }
+
+    client_t *client = (client_t *) malloc(sizeof(client_t));
+    client->fd = client_sd;
+
+    coro_create(&client->ctx, coroutine_entry_point, client, client->stack, STACK_SIZE);
+    coro_transfer(&client->main_ctx, &client->ctx);
+}
+
 int main_proxy(void) {
     struct ev_loop *loop = ev_default_loop(0);
     int reuseaddr = 1;
@@ -975,32 +1099,6 @@ int main_proxy(void) {
     return 0;
 }
 
-void accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
-    int client_sd;
-    struct ev_io *w_client;
-
-    if (EV_ERROR & revents) {
-        perror("got invalid event");
-        return;
-    }
-
-    client_sd = accept(watcher->fd, NULL, NULL);
-    if (client_sd < 0) {
-        perror("accept error");
-        return;
-    }
-
-    w_client = (struct ev_io *) malloc(sizeof(struct ev_io));
-    if (!w_client) {
-        perror("malloc error");
-        close(client_sd);
-        return;
-    }
-
-    ev_io_init(w_client, read_cb, client_sd, EV_READ);
-    ev_io_start(loop, w_client);
-
-}
 
 void cleanup_and_exit(struct ev_loop *loop, int server_sd) {
     if (server_sd >= 0) {
