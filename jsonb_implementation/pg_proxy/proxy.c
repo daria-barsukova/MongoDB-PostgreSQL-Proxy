@@ -22,7 +22,7 @@
 PG_MODULE_MAGIC;
 #endif
 
-#define MONGO_PORT 3391
+#define MONGO_PORT 3430
 #define BUFFER_SIZE 1024 * 3
 #define OP_QUERY 2004
 #define OP_REPLY 1
@@ -67,8 +67,6 @@ bool check_and_create_database(PGconn *conn, const char *dbname);
 
 bool check_and_create_table(PGconn *conn, const char *table_name);
 
-bool column_exists(PGconn *conn, const char *table_name, const char *column_name);
-
 const char *get_json_value_as_string(struct json_object *field_value);
 
 bool execute_insert_queries(PGconn *conn, const char *table_name, struct json_object *data_array, int *inserted_count);
@@ -83,7 +81,9 @@ bool execute_update_queries(PGconn *conn, const char *table_name, struct json_ob
 
 bool execute_query_update_to_postgres(const char *json_metadata, const char *json_data_array, int *updated_count);
 
-//bool execute_query_find_to_postgres(const char *json_metadata, struct json_object **results);
+bool
+execute_find_query(PGconn *conn, const char *table_name, struct json_object *find_json, struct json_object **results);
+
 bool execute_query_find_to_postgres(const char *json_metadata, struct json_object **results, const char **collection,
                                     const char **dbname);
 
@@ -199,24 +199,9 @@ bool execute_insert_queries(PGconn *conn, const char *table_name, struct json_ob
                  json_str);
 
 
-        // Send the query asynchronously
-        if (!PQsendQuery(conn, query)) {
-            fprintf(stderr, "Failed to send query: %s\n", PQerrorMessage(conn));
-            return false;
-        }
-
-        // Wait for the query to complete
-        while (PQisBusy(conn)) {
-            if (!PQconsumeInput(conn)) {
-                fprintf(stderr, "Failed to consume input: %s\n", PQerrorMessage(conn));
-                return false;
-            }
-        }
-
-        // Get the result
-        PGresult *res = PQgetResult(conn);
+        PGresult *res = PQexec(conn, query);
         if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-            fprintf(stderr, "UPDATE command failed: %s\n", PQerrorMessage(conn));
+            fprintf(stderr, "INSERT command failed: %s", PQerrorMessage(conn));
             PQclear(res);
             return false;
         }
@@ -312,23 +297,6 @@ bool execute_query_insert_to_postgres(const char *json_metadata, const char *jso
     return true;
 }
 
-bool column_exists(PGconn *conn, const char *table_name, const char *column_name) {
-    char query[BUFFER_SIZE];
-    snprintf(query, sizeof(query),
-             "SELECT column_name FROM information_schema.columns WHERE table_name='%s' AND column_name='%s'",
-             table_name, column_name);
-
-    PGresult *res = PQexec(conn, query);
-    if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        PQclear(res);
-        return false;
-    }
-
-    bool exists = PQntuples(res) > 0;
-    PQclear(res);
-    return exists;
-}
-
 bool
 execute_delete_queries(PGconn *conn, const char *table_name, struct json_object *delete_array, int *deleted_count) {
     int array_length = json_object_array_length(delete_array);
@@ -372,24 +340,9 @@ execute_delete_queries(PGconn *conn, const char *table_name, struct json_object 
                      table_name, jsonpath_condition, limit, table_name);
         }
 
-        // Send the query asynchronously
-        if (!PQsendQuery(conn, query)) {
-            fprintf(stderr, "Failed to send query: %s\n", PQerrorMessage(conn));
-            return false;
-        }
-
-        // Wait for the query to complete
-        while (PQisBusy(conn)) {
-            if (!PQconsumeInput(conn)) {
-                fprintf(stderr, "Failed to consume input: %s\n", PQerrorMessage(conn));
-                return false;
-            }
-        }
-
-        // Get the result
-        PGresult *res = PQgetResult(conn);
+        PGresult *res = PQexec(conn, query);
         if (PQresultStatus(res) != PGRES_COMMAND_OK) {
-            fprintf(stderr, "UPDATE command failed: %s\n", PQerrorMessage(conn));
+            fprintf(stderr, "DELETE command failed: %s", PQerrorMessage(conn));
             PQclear(res);
             return false;
         }
@@ -476,6 +429,40 @@ bool execute_query_delete_to_postgres(const char *json_metadata, const char *jso
     return true;
 }
 
+
+void build_jsonb_path_condition(struct json_object *q_json, char *jsonpath_condition) {
+    strcat(jsonpath_condition, "$.** ? (");
+
+    json_object_object_foreach(q_json, key, val)
+    {
+        char condition_part[BUFFER_SIZE];
+        snprintf(condition_part, sizeof(condition_part), "@.%s == \"%s\" && ", key, json_object_get_string(val));
+        strncat(jsonpath_condition, condition_part, sizeof(jsonpath_condition) - strlen(jsonpath_condition) - 1);
+    }
+
+    // Remove the trailing " && " and close the condition
+    jsonpath_condition[strlen(jsonpath_condition) - 4] = '\0';
+    strncat(jsonpath_condition, ")", sizeof(jsonpath_condition) - strlen(jsonpath_condition) - 1);
+}
+
+void build_jsonb_path(const char *key, char *path) {
+    const char *delimiter = ".";
+    char *key_copy = strdup(key);
+    char *token = strtok(key_copy, delimiter);
+
+    while (token != NULL) {
+        strcat(path, "\"");
+        strcat(path, token);
+        strcat(path, "\", ");
+        token = strtok(NULL, delimiter);
+    }
+
+    // Remove the trailing comma and space
+    path[strlen(path) - 2] = '\0';
+
+    free(key_copy);
+}
+
 bool
 execute_update_queries(PGconn *conn, const char *table_name, struct json_object *update_array, int *updated_count) {
     int array_length = json_object_array_length(update_array);
@@ -487,74 +474,66 @@ execute_update_queries(PGconn *conn, const char *table_name, struct json_object 
 
         if (!json_object_object_get_ex(update_json, "q", &q_json) ||
             !json_object_object_get_ex(update_json, "u", &u_json)) {
-            fprintf(stderr, "Invalid update JSON format\n");
+            fprintf(stderr, "Invalid update JSON format at index %d\n", i);
             return false;
         }
 
-        const char *q_str = json_object_to_json_string(q_json);
+        const char *q_str = json_object_to_json_string_ext(q_json, JSON_C_TO_STRING_PLAIN);
+
         struct json_object *set_json;
         if (!json_object_object_get_ex(u_json, "$set", &set_json)) {
-            fprintf(stderr, "Invalid update JSON format\n");
+            fprintf(stderr, "Invalid $set JSON format at index %d\n", i);
             return false;
         }
 
-        char set_clause[BUFFER_SIZE] = "data";
+        char jsonb_set_clause[BUFFER_SIZE * 10] = "";
         struct json_object_iterator it = json_object_iter_begin(set_json);
         struct json_object_iterator it_end = json_object_iter_end(set_json);
 
-        char jsonb_set_clause[BUFFER_SIZE] = "";
         while (!json_object_iter_equal(&it, &it_end)) {
             const char *field_name = json_object_iter_peek_name(&it);
             struct json_object *field_value = json_object_iter_peek_value(&it);
 
-            strcat(jsonb_set_clause, "jsonb_set(");
-            strcat(jsonb_set_clause, set_clause);
-            strcat(jsonb_set_clause, ", '{");
-            strcat(jsonb_set_clause, field_name);
-            strcat(jsonb_set_clause, "}', '");
-            strcat(jsonb_set_clause, json_object_to_json_string(field_value));
-            strcat(jsonb_set_clause, "'::jsonb), ");
+            char field_path[BUFFER_SIZE] = "";
+            build_jsonb_path(field_name, field_path);
+
+            char single_set_clause[BUFFER_SIZE];
+            snprintf(single_set_clause, sizeof(single_set_clause),
+                     "jsonb_set(data, '{%s}', '%s'::jsonb, true)",
+                     field_path, json_object_to_json_string_ext(field_value, JSON_C_TO_STRING_PLAIN));
+
+            strcat(jsonb_set_clause, single_set_clause);
+            strcat(jsonb_set_clause, ", ");
 
             json_object_iter_next(&it);
         }
 
         // Remove the last ", "
-        jsonb_set_clause[strlen(jsonb_set_clause) - 2] = '\0';
+        if (strlen(jsonb_set_clause) > 0) {
+            jsonb_set_clause[strlen(jsonb_set_clause) - 2] = '\0';
+        }
 
-        char query[BUFFER_SIZE];
+        // Build the condition using JSON path
+        char jsonpath_condition[BUFFER_SIZE * 10] = "";
+        build_jsonb_path_condition(q_json, jsonpath_condition);
+
+        char query[BUFFER_SIZE * 20];
         if (json_object_object_get_ex(update_json, "multi", &multi_json) && json_object_get_boolean(multi_json)) {
             snprintf(query, sizeof(query),
-                     "UPDATE %s SET data = %s WHERE data @> '%s'::jsonb",
-                     table_name, jsonb_set_clause, q_str);
+                     "UPDATE %s SET data = %s WHERE jsonb_path_exists(data, '%s')",
+                     table_name, jsonb_set_clause, jsonpath_condition);
         } else {
             snprintf(query, sizeof(query),
-                     "UPDATE %s SET data = %s WHERE ctid IN (SELECT ctid FROM %s WHERE data @> '%s'::jsonb LIMIT 1)",
-                     table_name, jsonb_set_clause, table_name, q_str);
+                     "UPDATE %s SET data = %s WHERE ctid IN (SELECT ctid FROM %s WHERE jsonb_path_exists(data, '%s') LIMIT 1)",
+                     table_name, jsonb_set_clause, table_name, jsonpath_condition);
         }
 
-
-        // Send the query asynchronously
-        if (!PQsendQuery(conn, query)) {
-            fprintf(stderr, "Failed to send query: %s\n", PQerrorMessage(conn));
-            return false;
-        }
-
-        // Wait for the query to complete
-        while (PQisBusy(conn)) {
-            if (!PQconsumeInput(conn)) {
-                fprintf(stderr, "Failed to consume input: %s\n", PQerrorMessage(conn));
-                return false;
-            }
-        }
-
-        // Get the result
-        PGresult *res = PQgetResult(conn);
+        PGresult *res = PQexec(conn, query);
         if (PQresultStatus(res) != PGRES_COMMAND_OK) {
             fprintf(stderr, "UPDATE command failed: %s\n", PQerrorMessage(conn));
             PQclear(res);
             return false;
         }
-
         *updated_count += atoi(PQcmdTuples(res));
         PQclear(res);
     }
@@ -728,25 +707,9 @@ execute_find_query(PGconn *conn, const char *table_name, struct json_object *fin
     }
 
 
-
-    // Send the query asynchronously
-    if (!PQsendQuery(conn, query)) {
-        fprintf(stderr, "Failed to send query: %s\n", PQerrorMessage(conn));
-        return false;
-    }
-
-    // Wait for the query to complete
-    while (PQisBusy(conn)) {
-        if (!PQconsumeInput(conn)) {
-            fprintf(stderr, "Failed to consume input: %s\n", PQerrorMessage(conn));
-            return false;
-        }
-    }
-
-    // Get the result
-    PGresult *res = PQgetResult(conn);
+    PGresult *res = PQexec(conn, query);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        fprintf(stderr, "UPDATE command failed: %s\n", PQerrorMessage(conn));
+        fprintf(stderr, "INSERT command failed: %s", PQerrorMessage(conn));
         PQclear(res);
         return false;
     }
@@ -928,6 +891,7 @@ process_message(uint32_t response_to,
         }
     }
     if (buffer[26] == 'u') {
+        elog(WARNING, "че там лежит в запросе %s", json_data_array);
         int updated_count = 0;
         if (execute_query_update_to_postgres(json_metadata, json_data_array, &updated_count)) {
             elog(WARNING, "Update from PostgreSQL successful %d", updated_count);

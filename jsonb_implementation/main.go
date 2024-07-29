@@ -71,19 +71,50 @@ import (
 func worker(wg *sync.WaitGroup, client *mongo.Client, id int) {
 	defer wg.Done()
 
-	collection := client.Database("testdb24").Collection("testcollection")
+	collection := client.Database("testdb29").Collection("testcollection1")
 
 	// Создание контекста с тайм-аутом
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	/*
+		// Вставка документа с вложенным массивом
+		insertResult, err := collection.InsertOne(ctx, bson.D{
+			{"name", "parent_document"},
+			{"worker", id},
+			{"items", bson.A{
+				bson.D{{"item_name", "item1"}, {"item_value", 10}},
+				bson.D{{"item_name", "item2"}, {"item_value", 20}},
+			}},
+		})
+		if err != nil {
+			log.Printf("Worker %d insert: %v\n", id, err)
+			return
+		}
+		fmt.Printf("Worker %d inserted document with ID: %v\n", id, insertResult.InsertedID)
 
-	// Вставка документа с вложенным массивом
+
+	*/
+	// Вставка документа с вложенными массивами и вложенными документами
 	insertResult, err := collection.InsertOne(ctx, bson.D{
 		{"name", "parent_document"},
 		{"worker", id},
 		{"items", bson.A{
-			bson.D{{"item_name", "item1"}, {"item_value", 10}},
-			bson.D{{"item_name", "item2"}, {"item_value", 20}},
+			bson.D{
+				{"item_name", "item1"},
+				{"item_value", 10},
+				{"details", bson.D{
+					{"detail_name", "detail1"},
+					{"detail_value", 100},
+				}},
+			},
+			bson.D{
+				{"item_name", "item2"},
+				{"item_value", 20},
+				{"details", bson.D{
+					{"detail_name", "detail2"},
+					{"detail_value", 200},
+				}},
+			},
 		}},
 	})
 	if err != nil {
@@ -91,6 +122,7 @@ func worker(wg *sync.WaitGroup, client *mongo.Client, id int) {
 		return
 	}
 	fmt.Printf("Worker %d inserted document with ID: %v\n", id, insertResult.InsertedID)
+
 	/*
 		// Поиск документа с вложенным массивом
 		filter := bson.D{{"name", "parent_document"}}
@@ -103,11 +135,14 @@ func worker(wg *sync.WaitGroup, client *mongo.Client, id int) {
 		fmt.Printf("Worker %d found document: %+v\n", id, result)
 	*/
 	// Обновление вложенного документа
-
-	updateFilter := bson.D{{"name", "parent_document"}}
+	updateFilter := bson.D{
+		{"name", "parent_document"},
+		{"items.item_name", "item2"},
+		{"items.details.detail_name", "detail2"},
+	}
 	update := bson.D{
 		{"$set", bson.D{
-			{"itemd", 18},
+			{"items.1.details.detail_value", 47484839}, // Прямое указание индекса массива
 		}},
 	}
 	updateResult, err := collection.UpdateMany(ctx, updateFilter, update)
@@ -116,15 +151,20 @@ func worker(wg *sync.WaitGroup, client *mongo.Client, id int) {
 		return
 	}
 	fmt.Printf("Worker %d updated %d document(s)\n", id, updateResult.ModifiedCount)
+	/*
+		deleteFilter := bson.D{
+			{"name", "parent_document"},
+			{"items.details.detail_name", "detail1"},
+		}
+		deleteResult, err := collection.DeleteMany(ctx, deleteFilter)
+		if err != nil {
+			log.Printf("Worker %d delete: %v\n", id, err)
+			return
+		}
+		fmt.Printf("Worker %d deleted %d document(s)\n", id, deleteResult.DeletedCount)
 
-	deleteFilter := bson.D{{"items.item_name", "item2"}}
-	deleteResult, err := collection.DeleteMany(ctx, deleteFilter)
-	if err != nil {
-		log.Printf("Worker %d delete: %v\n", id, err)
-		return
-	}
-	fmt.Printf("Worker %d deleted %d document(s)\n", id, deleteResult.DeletedCount)
 
+	*/
 	/*
 		// Поиск и вывод всех документов с вложенными элементами
 		cursor, err := collection.Find(ctx, bson.D{})
@@ -161,25 +201,30 @@ func worker(wg *sync.WaitGroup, client *mongo.Client, id int) {
 		}
 		fmt.Printf("Worker %d found one document: %+v\n", id, result)
 	*/
+	/*
+		exactMatchFilter := bson.D{
+			{"name", "parent_document"},
+			{"items.details.detail_name", "detail1"},
+		}
+		var exactMatchResults []bson.M
+		cursor, err := collection.Find(ctx, exactMatchFilter)
+		if err != nil {
+			log.Printf("Worker %d exact match find: %v\n", id, err)
+			return
+		}
+		defer cursor.Close(ctx)
 
-	exactMatchFilter := bson.D{{"items.item_value", 10}}
-	var exactMatchResults []bson.M
-	cursor, err := collection.Find(ctx, exactMatchFilter)
-	if err != nil {
-		log.Printf("Worker %d exact match find: %v\n", id, err)
-		return
-	}
-	defer cursor.Close(ctx)
+		if err = cursor.All(ctx, &exactMatchResults); err != nil {
+			log.Printf("Worker %d exact match find: %v\n", id, err)
+			return
+		}
+		fmt.Printf("Worker %d found documents: %+v\n", id, exactMatchResults)
 
-	if err = cursor.All(ctx, &exactMatchResults); err != nil {
-		log.Printf("Worker %d exact match find: %v\n", id, err)
-		return
-	}
-	fmt.Printf("Worker %d found documents: %+v\n", id, exactMatchResults)
 
+	*/
 }
 func main() {
-	clientOptions := options.Client().ApplyURI("mongodb://localhost:4464")
+	clientOptions := options.Client().ApplyURI("mongodb://localhost:3430")
 	//clientOptions.SetMaxPoolSize(1000)
 	client, err := mongo.Connect(context.TODO(), clientOptions)
 	if err != nil {
@@ -213,7 +258,7 @@ func main() {
 	var wg sync.WaitGroup
 
 	// Количество горутин для запуска
-	numWorkers := 10
+	numWorkers := 1
 
 	// Запуск горутин
 	for i := 0; i < numWorkers; i++ {
