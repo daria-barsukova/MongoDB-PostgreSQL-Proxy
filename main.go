@@ -3,12 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
-	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/mongo"
-	"go.mongodb.org/mongo-driver/mongo/options"
 	"log"
 	"sync"
 	"time"
+
+	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/mongo"
+	"go.mongodb.org/mongo-driver/mongo/options"
 )
 
 /*func listDatabases(client *mongo.Client) error {
@@ -79,8 +80,12 @@ func worker(wg *sync.WaitGroup, client *mongo.Client, id int) {
 
 	// Пример запроса на вставку (insert)
 	insertResult, err := collection.InsertMany(ctx, []interface{}{
-		bson.D{{"name", "example_name"}, {"worker", id}},
-		bson.D{{"name", "Bob"}, {"worker", id}},
+		bson.D{{"name", "Rihanna"}, {"worker1", id}},
+		bson.D{{"name", "LMFAO"}, {"worker1", id}},
+		bson.D{{"name", "example"}, {"worker5", id}},
+		bson.D{{"name", "example"}, {"worker7", id}},
+		bson.D{{"name", "example"}, {"worker8", id}},
+		bson.D{{"name", "example"}, {"worker9", id}},
 	})
 	if err != nil {
 		log.Printf("Worker %d insert: %v\n", id, err)
@@ -95,38 +100,37 @@ func worker(wg *sync.WaitGroup, client *mongo.Client, id int) {
 		return
 	}
 	fmt.Printf("Worker %d inserted another document: %v\n", id, insertResult2.InsertedID)
-	/*
-		var result bson.M
-			filter := bson.D{{"name", "example"}}
-			err = collection.FindOne(ctx, filter).Decode(&result)
-			if err != nil {
-				log.Printf("Worker %d find: %v\n", id, err)
-				return
-			}
-			fmt.Printf("Worker %d found a single document: %+v\n", id, result)
-	*/
-	/*
-		// Пример запроса на чтение (find)
-		filter := bson.D{{"name", "example"}}
-		cursor, err := collection.Find(ctx, filter)
-		if err != nil {
-			log.Printf("Worker %d find: %v\n", id, err)
-			return
-		}
-		defer cursor.Close(ctx)
 
-		var results []bson.M
-		if err = cursor.All(ctx, &results); err != nil {
-			log.Printf("Worker %d find: %v\n", id, err)
-			return
-		}
-		fmt.Printf("Worker %d found documents: %+v\n", id, results)
-	*/
+	var result bson.M
+	filter := bson.D{{"name", "example"}}
+	err = collection.FindOne(ctx, filter).Decode(&result)
+	if err != nil {
+		log.Printf("Worker %d find: %v\n", id, err)
+		return
+	}
+	fmt.Printf("Worker %d found a single document: %+v\n", id, result)
+
+	// Пример запроса на чтение (find)
+	filter = bson.D{{"name", "example"}}
+	cursor, err := collection.Find(ctx, filter)
+	if err != nil {
+		log.Printf("Worker %d find: %v\n", id, err)
+		return
+	}
+	defer cursor.Close(ctx)
+
+	var results []bson.M
+	if err = cursor.All(ctx, &results); err != nil {
+		log.Printf("Worker %d find: %v\n", id, err)
+		return
+	}
+	fmt.Printf("Worker %d found documents: %+v\n", id, results)
+
 	// Пример запроса на обновление (update)
 	updateFilter := bson.D{{"name", "example"}}
 	update := bson.D{
 		{"$set", bson.D{
-			{"names", "updated_example"},
+			{"names", "update_aidachar"},
 		}},
 	}
 	updateResult, err := collection.UpdateMany(ctx, updateFilter, update)
@@ -137,7 +141,7 @@ func worker(wg *sync.WaitGroup, client *mongo.Client, id int) {
 	fmt.Printf("Worker %d updated %d document(s)\n", id, updateResult.ModifiedCount)
 
 	// Пример запроса на удаление (delete)
-	deleteResult, err := collection.DeleteMany(ctx, bson.D{{"name", "example_name"}})
+	deleteResult, err := collection.DeleteMany(ctx, bson.D{{"name", "example"}})
 	if err != nil {
 		log.Printf("Worker %d delete: %v\n", id, err)
 		return
@@ -146,7 +150,7 @@ func worker(wg *sync.WaitGroup, client *mongo.Client, id int) {
 }
 
 func main() {
-	clientOptions := options.Client().ApplyURI("mongodb://localhost:5025")
+	clientOptions := options.Client().ApplyURI("mongodb://localhost:3385")
 	client, err := mongo.Connect(context.TODO(), clientOptions)
 	if err != nil {
 		log.Fatal(err)
