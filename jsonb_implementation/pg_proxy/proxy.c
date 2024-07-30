@@ -21,7 +21,7 @@
 PG_MODULE_MAGIC;
 #endif
 
-#define MONGO_PORT 3432
+#define MONGO_PORT 3447
 #define BUFFER_SIZE 1024 * 3
 #define OP_QUERY 2004
 #define OP_REPLY 1
@@ -86,9 +86,6 @@ bool execute_query_update_to_postgres(const char *json_metadata, const char *jso
 
 bool
 execute_find_query(PGconn *conn, const char *table_name, struct json_object *find_json, struct json_object **results);
-
-bool execute_query_find_to_postgres(const char *json_metadata, struct json_object **results, char **collection,
-                                    char **dbname);
 
 void cleanup_and_exit(struct ev_loop *loop, int server_sd);
 
@@ -165,7 +162,7 @@ bool check_and_create_table(PGconn *conn, const char *table_name) {
     /* Create table if it does not exist. */
     snprintf(query, sizeof(query),
              "CREATE TABLE IF NOT EXISTS %s ("
-             "_id SERIAL PRIMARY KEY, "
+
              "data JSONB)",
              table_name);
     res = PQexec(conn, query);
@@ -209,18 +206,14 @@ bool execute_insert_queries(PGconn *conn, const char *table_name, struct json_ob
     for (i = 0; i < array_length; i++) {
         data_json = json_object_array_get_idx(data_array, i);
 
-        /* Remove _id field if present */
-        json_object_object_del(data_json, "_id");
-
         /* Convert JSON object to string */
         json_str = json_object_to_json_string(data_json);
 
         /* Construct SQL query for insertion into jsonb column */
-        snprintf(query, sizeof(query), "INSERT INTO %s (data) VALUES ('%s'::jsonb) RETURNING _id", table_name,
-                 json_str);
+        snprintf(query, sizeof(query), "INSERT INTO %s (data) VALUES ('%s'::jsonb)", table_name, json_str);
 
         res = PQexec(conn, query);
-        if (PQresultStatus(res) != PGRES_TUPLES_OK) {
+        if (PQresultStatus(res) != PGRES_COMMAND_OK) {
             fprintf(stderr, "INSERT command failed: %s", PQerrorMessage(conn));
             PQclear(res);
             return false;
@@ -708,35 +701,21 @@ bool execute_query_update_to_postgres(const char *json_metadata, const char *jso
    Stores results in results parameter. */
 bool
 execute_find_query(PGconn *conn, const char *table_name, struct json_object *find_json, struct json_object **results) {
-    struct json_object *filter_json;
-    struct json_object *limit_json;
-    char condition[BUFFER_SIZE];
-    int limit;
-    bool has_nested_field;
-    PGresult *res;
-    int rows;
-    int i;
-    int j;
+    struct json_object *filter_json, *limit_json;
+    char condition[BUFFER_SIZE] = "";
+    int limit = -1;
+    bool has_nested_field = false;
 
-    memset(condition, 0, sizeof(condition));
-    limit = -1;
-    has_nested_field = 0;
-
-    /* Parse filter conditions from JSON */
+    // Parse filter conditions from JSON
     if (json_object_object_get_ex(find_json, "filter", &filter_json)) {
-        struct json_object_iterator it;
-        struct json_object_iterator it_end;
+        struct json_object_iterator it = json_object_iter_begin(filter_json);
+        struct json_object_iterator it_end = json_object_iter_end(filter_json);
 
-        it = json_object_iter_begin(filter_json);
-        it_end = json_object_iter_end(filter_json);
-
-        /* Check if there are any nested fields */
+        // Check if there are any nested fields
         while (!json_object_iter_equal(&it, &it_end)) {
-            const char *field_name;
-
-            field_name = json_object_iter_peek_name(&it);
+            const char *field_name = json_object_iter_peek_name(&it);
             if (strchr(field_name, '.')) {
-                has_nested_field = 1;
+                has_nested_field = true;
                 break;
             }
             json_object_iter_next(&it);
@@ -744,15 +723,11 @@ execute_find_query(PGconn *conn, const char *table_name, struct json_object *fin
 
         it = json_object_iter_begin(filter_json);
         if (!has_nested_field) {
-            /* Simple fields logic */
+            // Simple fields logic
             while (!json_object_iter_equal(&it, &it_end)) {
-                const char *field_name;
-                struct json_object *field_value;
-                const char *value_str;
-
-                field_name = json_object_iter_peek_name(&it);
-                field_value = json_object_iter_peek_value(&it);
-                value_str = json_object_get_string(field_value);
+                const char *field_name = json_object_iter_peek_name(&it);
+                struct json_object *field_value = json_object_iter_peek_value(&it);
+                const char *value_str = json_object_get_string(field_value);
 
                 strcat(condition, "data->>");
                 strcat(condition, "'");
@@ -765,22 +740,18 @@ execute_find_query(PGconn *conn, const char *table_name, struct json_object *fin
                 json_object_iter_next(&it);
             }
 
-            /* Remove last " AND " */
+            // Remove last " AND "
             if (strlen(condition) > 0) {
                 condition[strlen(condition) - 5] = '\0';
             }
         } else {
-            /* Nested fields logic */
+            // Nested fields logic
             while (!json_object_iter_equal(&it, &it_end)) {
-                const char *field_name;
-                struct json_object *field_value;
-                const char *value_str;
+                const char *field_name = json_object_iter_peek_name(&it);
+                struct json_object *field_value = json_object_iter_peek_value(&it);
+                const char *value_str = json_object_to_json_string_ext(field_value, JSON_C_TO_STRING_PLAIN);
+
                 char nested_condition[BUFFER_SIZE];
-
-                field_name = json_object_iter_peek_name(&it);
-                field_value = json_object_iter_peek_value(&it);
-                value_str = json_object_to_json_string_ext(field_value, JSON_C_TO_STRING_PLAIN);
-
                 snprintf(nested_condition, sizeof(nested_condition),
                          "jsonb_path_exists(data, '$.%s ? (@ == %s)'::jsonpath)",
                          field_name, value_str);
@@ -790,68 +761,62 @@ execute_find_query(PGconn *conn, const char *table_name, struct json_object *fin
                 json_object_iter_next(&it);
             }
 
-            /* Remove last " AND " */
+            // Remove last " AND "
             if (strlen(condition) > 0) {
                 condition[strlen(condition) - 5] = '\0';
             }
         }
     }
 
-    /* Parse limit from the JSON */
+    // Parse limit from the JSON
     if (json_object_object_get_ex(find_json, "limit", &limit_json)) {
         limit = json_object_get_int(limit_json);
     }
 
-    /* Construct SQL query */
+    // Construct SQL query
+    char query[BUFFER_SIZE];
     if (strlen(condition) > 0) {
         if (limit > 0) {
-            snprintf(condition, sizeof(condition), "SELECT * FROM %s WHERE %s LIMIT %d", table_name, condition, limit);
+            snprintf(query, sizeof(query), "SELECT * FROM %s WHERE %s LIMIT %d", table_name, condition, limit);
         } else {
-            snprintf(condition, sizeof(condition), "SELECT * FROM %s WHERE %s", table_name, condition);
+            snprintf(query, sizeof(query), "SELECT * FROM %s WHERE %s", table_name, condition);
         }
     } else {
         if (limit > 0) {
-            snprintf(condition, sizeof(condition), "SELECT * FROM %s LIMIT %d", table_name, limit);
+            snprintf(query, sizeof(query), "SELECT * FROM %s LIMIT %d", table_name, limit);
         } else {
-            snprintf(condition, sizeof(condition), "SELECT * FROM %s", table_name);
+            snprintf(query, sizeof(query), "SELECT * FROM %s", table_name);
         }
     }
 
-    res = PQexec(conn, condition);
+    PGresult *res = PQexec(conn, query);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         fprintf(stderr, "SELECT command failed: %s", PQerrorMessage(conn));
         PQclear(res);
-        return 0;
+        return false;
     }
 
-    /* Process query results */
-    rows = PQntuples(res);
+    // Process query results
+    int rows = PQntuples(res);
     *results = json_object_new_array();
 
-    for (i = 0; i < rows; i++) {
-        struct json_object *row_obj;
-        int n_fields;
+    for (int i = 0; i < rows; i++) {
+        struct json_object *row_obj = json_object_new_object();
+        int n_fields = PQnfields(res);
 
-        row_obj = json_object_new_object();
-        n_fields = PQnfields(res);
+        for (int j = 0; j < n_fields; j++) {
+            const char *field_name = PQfname(res, j);
+            const char *field_value = PQgetvalue(res, i, j);
 
-        for (j = 0; j < n_fields; j++) {
-            const char *field_name;
-            const char *field_value;
-            struct json_object *json_value;
-
-            field_name = PQfname(res, j);
-            field_value = PQgetvalue(res, i, j);
-
-            /* Assume all fields are JSONB and parse accordingly */
-            json_value = json_tokener_parse(field_value);
+            // Assume all fields are JSONB and parse accordingly
+            struct json_object *json_value = json_tokener_parse(field_value);
             json_object_object_add(row_obj, field_name, json_value);
         }
         json_object_array_add(*results, row_obj);
     }
 
     PQclear(res);
-    return 1;
+    return true;
 }
 
 /* Connects to database, checks and creates required table if it doesn't exist,
@@ -859,36 +824,31 @@ execute_find_query(PGconn *conn, const char *table_name, struct json_object *fin
    Stores results and returns true if operation was successful, false otherwise. */
 bool execute_query_find_to_postgres(const char *json_metadata, struct json_object **results, char **collection,
                                     char **dbname) {
-    PGconn *conn;
-    struct json_object *metadata_json;
-    struct json_object *find_obj;
-    struct json_object *db_obj;
-    char conninfo[BUFFER_SIZE];
-
-    conn = PQconnectdb(PG_CONNINFO);
+    PGconn *conn = PQconnectdb(PG_CONNINFO);
     if (PQstatus(conn) != CONNECTION_OK) {
         fprintf(stderr, "Connection to database failed: %s", PQerrorMessage(conn));
         PQfinish(conn);
-        return 0;
+        return false;
     }
 
-    metadata_json = json_tokener_parse(json_metadata);
+    struct json_object *metadata_json = json_tokener_parse(json_metadata);
     if (!metadata_json) {
         fprintf(stderr, "Failed to parse metadata JSON\n");
         PQfinish(conn);
-        return 0;
+        return false;
     }
 
+    struct json_object *find_obj, *db_obj;
     if (!json_object_object_get_ex(metadata_json, "find", &find_obj) ||
         !json_object_object_get_ex(metadata_json, "$db", &db_obj)) {
         fprintf(stderr, "Invalid metadata JSON format\n");
         json_object_put(metadata_json);
         PQfinish(conn);
-        return 0;
+        return false;
     }
 
-    *collection = strdup(json_object_get_string(find_obj));
-    *dbname = strdup(json_object_get_string(db_obj));
+    strcpy(*collection, json_object_get_string(find_obj));
+    strcpy(*dbname, json_object_get_string(db_obj));
     fprintf(stderr, "EXECUTE_QUERY_FIND_TO_POSTGRES: line: %d dbname: %s collection: %s\n", __LINE__, *dbname,
             *collection);
 
@@ -896,38 +856,49 @@ bool execute_query_find_to_postgres(const char *json_metadata, struct json_objec
         fprintf(stderr, "Failed to create or check database\n");
         json_object_put(metadata_json);
         PQfinish(conn);
-        return 0;
+        return false;
     }
 
     PQfinish(conn);
 
+    char conninfo[BUFFER_SIZE];
     snprintf(conninfo, sizeof(conninfo), "dbname=%s user=user1 password=passwd port=5433", *dbname);
     conn = PQconnectdb(conninfo);
     if (PQstatus(conn) != CONNECTION_OK) {
         fprintf(stderr, "Connection to database %s failed: %s", *dbname, PQerrorMessage(conn));
         json_object_put(metadata_json);
         PQfinish(conn);
-        return 0;
+        return false;
     }
 
     if (!check_and_create_table(conn, *collection)) {
         fprintf(stderr, "Failed to create or check table\n");
         json_object_put(metadata_json);
         PQfinish(conn);
-        return 0;
+        return false;
     }
 
-    if (!execute_find_query(conn, *collection, metadata_json, results)) {
-        fprintf(stderr, "Failed to execute find query\n");
+    struct json_object *find_json = json_tokener_parse(json_metadata);
+    if (!find_json) {
+        fprintf(stderr, "Failed to parse find JSON\n");
         json_object_put(metadata_json);
         PQfinish(conn);
-        return 0;
+        return false;
+    }
+
+    if (!execute_find_query(conn, *collection, find_json, results)) {
+        fprintf(stderr, "Failed to execute find query\n");
+        json_object_put(metadata_json);
+        json_object_put(find_json);
+        PQfinish(conn);
+        return false;
     }
 
     json_object_put(metadata_json);
+    json_object_put(find_json);
     PQfinish(conn);
 
-    return 1;
+    return true;
 }
 
 /* Processes incoming message and performs corresponding database operations
@@ -1034,34 +1005,33 @@ void process_message(uint32_t response_to,
 
 typedef struct {
     struct ev_io io;       // Event watcher for libev
-    int fd;                // File descriptor for client connection
-    coro_context ctx;      // Coroutine context for client
+    int fd;                // File descriptor for the client connection
+    coro_context ctx;      // Coroutine context for the client
     coro_context main_ctx; // Main coroutine context
-    char stack[STACK_SIZE]; // Stack for coroutine
-    unsigned char response[BUFFER_SIZE]; // Buffer for response to be sent to client
-    ssize_t response_len;  // Length of response
+    char stack[STACK_SIZE]; // Stack for the coroutine
+    unsigned char response[BUFFER_SIZE]; // Buffer for the response to be sent to the client
+    ssize_t response_len;  // Length of the response
 } client_t;
 
 void coroutine_entry_point(void *arg) {
     client_t *client = (client_t *) arg;
     struct ev_loop *loop = ev_default_loop(0);
 
-    ev_io_init(&client->io, read_cb, client->fd, EV_READ); // Initialize read event watcher
-    ev_io_start(loop, &client->io); // Start read event watcher
+    ev_io_init(&client->io, read_cb, client->fd, EV_READ); // Initialize the read event watcher
+    ev_io_start(loop, &client->io); // Start the read event watcher
 
-    // Transfer control back to main context
+    // Transfer control back to the main context
     coro_transfer(&client->ctx, &client->main_ctx);
 
-    // Start event loop to handle client events
+    // Start the event loop to handle client events
     ev_run(loop, 0);
 
     close(client->fd);
     free(client);
 }
 
-// Callback for accepting new connections
 void accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
-    if (EV_ERROR & revents) {
+    if (revents & EV_ERROR) {
         perror("got invalid event");
         return;
     }
@@ -1076,12 +1046,10 @@ void accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     client->fd = client_sd;
     client->response_len = 0;
 
-    // Initialize coroutine for client handling
-    coro_create(&client->ctx, coroutine_entry_point, client, client->stack, sizeof(client->stack));
+    coro_create(&client->ctx, coroutine_entry_point, client, client->stack, STACK_SIZE);
     coro_transfer(&client->main_ctx, &client->ctx);
 }
 
-// Main proxy server function
 int main_proxy(void) {
     struct ev_loop *loop = ev_default_loop(0);
     int reuseaddr = 1;
@@ -1089,13 +1057,13 @@ int main_proxy(void) {
     struct ev_io w_accept;
     int server_sd = -1;
 
-    // Create server socket
+    // Create new socket
     if ((server_sd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
         perror("socket error");
         return -1;
     }
 
-    // Set socket options
+    // Set socket options to reuse address
     if (setsockopt(server_sd, SOL_SOCKET, SO_REUSEADDR, &reuseaddr, sizeof(reuseaddr)) < 0) {
         perror("setsockopt error");
         close(server_sd);
@@ -1107,14 +1075,14 @@ int main_proxy(void) {
     addr.sin_port = htons(MONGO_PORT);
     addr.sin_addr.s_addr = INADDR_ANY;
 
-    // Bind socket
+    // Bind socket to address and port
     if (bind(server_sd, (struct sockaddr *) &addr, sizeof(addr)) != 0) {
         perror("bind error");
         close(server_sd);
         return -1;
     }
 
-    // Listen for connections
+    // Listen for incoming connections
     if (listen(server_sd, 128) < 0) {
         perror("listen error");
         close(server_sd);
@@ -1130,7 +1098,6 @@ int main_proxy(void) {
     return 0;
 }
 
-// Cleanup and exit function
 void cleanup_and_exit(struct ev_loop *loop, int server_sd) {
     if (server_sd >= 0) {
         close(server_sd);
@@ -1139,14 +1106,13 @@ void cleanup_and_exit(struct ev_loop *loop, int server_sd) {
     exit(0);
 }
 
-// Callback for reading from client
 void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     client_t *client = (client_t *) watcher;
     unsigned char buffer[BUFFER_SIZE];
     ssize_t read;
 
-    char *query_string = NULL;
-    char *parameter_string = NULL;
+    char **query_string;
+    char **parameter_string;
     u_int32_t msg_length = 0;
     u_int32_t request_id = 0;
     u_int32_t response_to = 0;
@@ -1166,13 +1132,12 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
 
     unsigned char response[] = "I\001\000\000~\001\000\000\003\000\000\000\001\000\000\000\b\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\001\000\000\000%\001\000\000\bhelloOk\000\001\bismaster\000\001\003topologyVersion\000-\000\000\000\aprocessId\000f\225\335\246B(\\C\202\2468\351\022counter\000\000\000\000\000\000\000\000\000\000\020maxBsonObjectSize\000\000\000\000\001\020maxMessageSizeBytes\000\000l\334\002\020maxWriteBatchSize\000\240\206\001\000\tlocalTime\000\032T\246\271\220\001\000\000\020logicalSessionTimeoutMinutes\000\036\000\000\000\020connectionId\000*\000\000\000\020minWireVersion\000\000\000\000\000\020maxWireVersion\000\025\000\000\000\breadOnly\000\000\001ok\000\000\000\000\000\000\000\360?";
 
-
     if (EV_ERROR & revents) {
         perror("got invalid event");
         return;
     }
 
-    // Read data from client
+    // Read data from client socket
     read = recv(watcher->fd, buffer, BUFFER_SIZE, 0);
 
     if (read < 0) {
@@ -1203,45 +1168,57 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
             break;
 
         case OP_MSG:
-            query_string = (char *) malloc(BUFFER_SIZE);
-            parameter_string = (char *) malloc(BUFFER_SIZE);
+            query_string = (char **) malloc(sizeof(char *));
+            parameter_string = (char **) malloc(sizeof(char *));
+            *query_string = NULL;
+            *parameter_string = NULL;
 
             // Parse message
-            parse_message(buffer, &query_string, &parameter_string);
+            parse_message(buffer, query_string, parameter_string);
 
-            struct json_object *results = NULL;
-            char *dbname = (char *) malloc(256);
-            char *collection = (char *) malloc(256);
+            struct json_object *results;
+            char **dbname = (char **) malloc(sizeof(char *));
+            *dbname = (char *) malloc(256);
+            memset(*dbname, 0, 256);
+            char **collection = (char **) malloc(sizeof(char *));
+            *collection = (char *) malloc(256);
+            memset(*collection, 0, 256);
             int changed_count = 0;
 
             // Process message and determine response
-            process_message(request_id, buffer, query_string, parameter_string, &flag, &results, &dbname, &collection, &changed_count);
+            process_message(request_id, buffer, *query_string, *parameter_string, &flag, &results, dbname, collection,
+                            &changed_count);
 
             switch (flag) {
                 case 2:
                     elog(WARNING, "send ping");
                     modify_ping_endsessions_reply(ping_endsessions_ok, request_id);
-                    memcpy(client->response, ping_endsessions_ok, sizeof(ping_endsessions_ok));
-                    client->response_len = sizeof(ping_endsessions_ok);
+                    memcpy(client->response, ping_endsessions_ok, PING_ENDSESSIONS_REPLY_LEN);
+                    client->response_len = PING_ENDSESSIONS_REPLY_LEN;
                     break;
                 case 3:
-                case 6:
-                    elog(WARNING, "send insert/delete");
+                    elog(WARNING, "send insert");
                     modify_insert_delete_reply(insert_delete_ok, request_id, changed_count);
-                    memcpy(client->response, insert_delete_ok, sizeof(insert_delete_ok));
-                    client->response_len = sizeof(insert_delete_ok);
+                    memcpy(client->response, insert_delete_ok, INSERT_DELETE_REPLY_LEN);
+                    client->response_len = INSERT_DELETE_REPLY_LEN;
+                    break;
+                case 6:
+                    elog(WARNING, "send delete");
+                    modify_insert_delete_reply(insert_delete_ok, request_id, changed_count);
+                    memcpy(client->response, insert_delete_ok, INSERT_DELETE_REPLY_LEN);
+                    client->response_len = INSERT_DELETE_REPLY_LEN;
                     break;
                 case 8:
                     elog(WARNING, "send update");
                     modify_update_reply(update_ok, response_to, changed_count);
-                    memcpy(client->response, update_ok, sizeof(update_ok));
-                    client->response_len = sizeof(update_ok);
+                    memcpy(client->response, update_ok, UPDATE_REPLY_LEN);
+                    client->response_len = UPDATE_REPLY_LEN;
                     break;
                 case 10:
                     elog(WARNING, "send find");
                     unsigned char find_reply[BUFFER_SIZE];
-                    memset(find_reply, 0, sizeof(find_reply));
-                    int find_reply_len = generate_find_reply_packet(results, find_reply, 0x06, dbname, collection);
+                    memset(find_reply, 0, BUFFER_SIZE);
+                    int find_reply_len = generate_find_reply_packet(results, find_reply, 0x06, *dbname, *collection);
                     if (find_reply_len == -1) {
                         elog(WARNING, "generate_find_reply_packet got an error");
                     }
@@ -1252,22 +1229,28 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
                 case 5:
                     elog(WARNING, "terminate session");
                     modify_ping_endsessions_reply(ping_endsessions_ok, request_id);
-                    memcpy(client->response, ping_endsessions_ok, sizeof(ping_endsessions_ok));
-                    client->response_len = sizeof(ping_endsessions_ok);
+                    memcpy(client->response, ping_endsessions_ok, PING_ENDSESSIONS_REPLY_LEN);
+                    client->response_len = PING_ENDSESSIONS_REPLY_LEN;
                     break;
                 default:
-                    elog(WARNING, "unknown flag %d", flag);
                     break;
             }
 
+            if (*query_string != NULL) {
+                free(*query_string);
+            }
+            if (*parameter_string != NULL) {
+                free(*parameter_string);
+            }
             free(query_string);
             free(parameter_string);
+            free(*dbname);
+            free(*collection);
             free(dbname);
             free(collection);
             break;
 
         case OP_REPLY:
-            // Handle reply messages if needed
             break;
 
         default:
@@ -1281,7 +1264,6 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     ev_io_start(loop, &client->io);
 }
 
-// Callback for writing to client
 void write_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     client_t *client = (client_t *) watcher;
 
@@ -1303,7 +1285,6 @@ void write_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     ev_io_init(&client->io, read_cb, client->fd, EV_READ);
     ev_io_start(loop, &client->io);
 }
-
 
 void _PG_init(void) {
     BackgroundWorker worker;
