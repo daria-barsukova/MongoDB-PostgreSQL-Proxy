@@ -16,13 +16,12 @@
 #include "coro.h"
 #include "config.h"
 
-
 #ifdef PG_MODULE_MAGIC
 
 PG_MODULE_MAGIC;
 #endif
 
-#define MONGO_PORT 3430
+#define MONGO_PORT 3482
 #define BUFFER_SIZE 1024 * 3
 #define OP_QUERY 2004
 #define OP_REPLY 1
@@ -31,15 +30,10 @@ PG_MODULE_MAGIC;
 #define INSERT_DELETE_REPLY_LEN 45
 #define UPDATE_REPLY_LEN 60
 #define PG_CONNINFO "dbname=postgres user=user1 password=passwd host=localhost port=5433"
-
-
 #define BODY_MSG_SECTION_TYPE 0
 #define DOC_MSG_SECTION_TYPE 1
-
 #define MAX_BSON_OBJECTS 10
-
-#define STACK_SIZE (1024 * 1024)  // 1 MB
-
+#define STACK_SIZE (1024 * 1024)
 
 PGDLLEXPORT int main_proxy(void);
 
@@ -48,8 +42,6 @@ void accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents);
 void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents);
 
 void write_cb(struct ev_loop *loop, struct ev_io *watcher, int revents);
-
-//void process_message(uint32_t response_to, unsigned char *buffer, char *json_metadata, char *json_data_array, int *flag);
 
 void
 process_message(uint32_t response_to, unsigned char *buffer, char *json_metadata, char *json_data_array,
@@ -77,6 +69,10 @@ bool execute_delete_queries(PGconn *conn, const char *table_name, struct json_ob
 
 bool execute_query_delete_to_postgres(const char *json_metadata, const char *json_data_array, int *deleted_count);
 
+void build_jsonb_path_condition(struct json_object *q_json, char *jsonpath_condition);
+
+void build_jsonb_path(const char *key, char *path);
+
 bool execute_update_queries(PGconn *conn, const char *table_name, struct json_object *update_array, int *updated_count);
 
 bool execute_query_update_to_postgres(const char *json_metadata, const char *json_data_array, int *updated_count);
@@ -84,8 +80,8 @@ bool execute_query_update_to_postgres(const char *json_metadata, const char *jso
 bool
 execute_find_query(PGconn *conn, const char *table_name, struct json_object *find_json, struct json_object **results);
 
-bool execute_query_find_to_postgres(const char *json_metadata, struct json_object **results, const char **collection,
-                                    const char **dbname);
+bool execute_query_find_to_postgres(const char *json_metadata, struct json_object **results, char **collection,
+                                    char **dbname);
 
 void cleanup_and_exit(struct ev_loop *loop, int server_sd);
 
@@ -116,24 +112,29 @@ int generate_cursor(struct json_object *data_array, char *reply, char *db_name, 
 
 int generate_ns_element(char *reply, char *db_name, char *table_name);
 
-static void handle_sigterm(SIGNAL_ARGS, int server_sd) {
+/* Signal handler for SIGTERM to gracefully close the server socket and exit. */
+static void handle_sigterm(int sig, int server_sd) {
     if (server_sd >= 0) {
         close(server_sd);
     }
     exit(0);
 }
 
+/* Check if database exists, and if not, create it.
+   Returns true if database exists or was created successfully, false otherwise. */
 bool check_and_create_database(PGconn *conn, const char *dbname) {
     char query[BUFFER_SIZE];
+    PGresult *res;
     snprintf(query, sizeof(query), "SELECT 1 FROM pg_database WHERE datname='%s'", dbname);
 
-    PGresult *res = PQexec(conn, query);
+    res = PQexec(conn, query);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
         PQclear(res);
         return false;
     }
 
-    //ALTER USER user1 CREATEDB;
+    // ALTER USER user1 CREATEDB;
+    /* If database does not exist, create it. */
     if (PQntuples(res) == 0) {
         PQclear(res);
         snprintf(query, sizeof(query), "CREATE DATABASE %s", dbname);
@@ -148,15 +149,20 @@ bool check_and_create_database(PGconn *conn, const char *dbname) {
     return true;
 }
 
+/* Check if table exists, and if not, create it.
+   Returns true if table exists or was created successfully, false otherwise. */
 bool check_and_create_table(PGconn *conn, const char *table_name) {
     char query[BUFFER_SIZE];
+    PGresult *res;
+
+    /* Create table if it does not exist. */
     snprintf(query, sizeof(query),
              "CREATE TABLE IF NOT EXISTS %s ("
              "_id SERIAL PRIMARY KEY, "
              "data JSONB)",
              table_name);
 
-    PGresult *res = PQexec(conn, query);
+    res = PQexec(conn, query);
     if (PQresultStatus(res) != PGRES_COMMAND_OK) {
         fprintf(stderr, "Table creation failed: %s\n", PQerrorMessage(conn));
         PQclear(res);
@@ -167,6 +173,8 @@ bool check_and_create_table(PGconn *conn, const char *table_name) {
     return true;
 }
 
+/* Retrieve string representation of JSON value.
+   Returns string representation of JSON value if it is of a recognized type, NULL otherwise. */
 const char *get_json_value_as_string(struct json_object *field_value) {
     if (json_object_is_type(field_value, json_type_string)) {
         return json_object_get_string(field_value);
@@ -180,6 +188,8 @@ const char *get_json_value_as_string(struct json_object *field_value) {
     return NULL;
 }
 
+/* Executes insert queries for each JSON object in data array into specified table.
+   Updates inserted count and returns true if all inserts were successful, false otherwise. */
 bool execute_insert_queries(PGconn *conn, const char *table_name, struct json_object *data_array, int *inserted_count) {
     int array_length = json_object_array_length(data_array);
     *inserted_count = 0;
@@ -187,13 +197,10 @@ bool execute_insert_queries(PGconn *conn, const char *table_name, struct json_ob
     for (int i = 0; i < array_length; i++) {
         struct json_object *data_json = json_object_array_get_idx(data_array, i);
 
-        // Remove _id field if present
-        //json_object_object_del(data_json, "_id");
-
-        // Convert JSON object to string
+        /* Convert JSON object to string */
         const char *json_str = json_object_to_json_string(data_json);
 
-        // Construct SQL query for insertion into jsonb column
+        /* Construct SQL query for insertion into jsonb column */
         char query[BUFFER_SIZE];
         snprintf(query, sizeof(query), "INSERT INTO %s (data) VALUES ('%s'::jsonb) RETURNING _id", table_name,
                  json_str);
@@ -212,9 +219,12 @@ bool execute_insert_queries(PGconn *conn, const char *table_name, struct json_ob
     return true;
 }
 
-
+/* Connects to database, creates it and required table if they don't exist,
+   and executes insert queries for given data array.
+   Returns true if operation was successful, false otherwise. */
 bool execute_query_insert_to_postgres(const char *json_metadata, const char *json_data_array, int *inserted_count) {
-    // Connect to database
+
+    /* Connect to initial database */
     PGconn *conn = PQconnectdb(PG_CONNINFO);
     if (PQstatus(conn) != CONNECTION_OK) {
         fprintf(stderr, "Connection to database failed: %s", PQerrorMessage(conn));
@@ -222,7 +232,7 @@ bool execute_query_insert_to_postgres(const char *json_metadata, const char *jso
         return false;
     }
 
-    // Parse metadata JSON
+    /* Parse metadata JSON */
     struct json_object *metadata_json = json_tokener_parse(json_metadata);
     if (!metadata_json) {
         fprintf(stderr, "Failed to parse metadata JSON\n");
@@ -242,7 +252,7 @@ bool execute_query_insert_to_postgres(const char *json_metadata, const char *jso
     const char *collection = json_object_get_string(insert_obj);
     const char *dbname = json_object_get_string(db_obj);
 
-    // Check and create database if it does not exist
+    /* Check and create database if it does not exist */
     if (!check_and_create_database(conn, dbname)) {
         fprintf(stderr, "Failed to create or check database\n");
         json_object_put(metadata_json);
@@ -252,7 +262,7 @@ bool execute_query_insert_to_postgres(const char *json_metadata, const char *jso
 
     PQfinish(conn);
 
-    // Connect to specified database
+    /* Connect to specified database */
     char conninfo[BUFFER_SIZE];
     snprintf(conninfo, sizeof(conninfo), "dbname=%s user=user1 password=passwd port=5433", dbname);
     conn = PQconnectdb(conninfo);
@@ -263,7 +273,7 @@ bool execute_query_insert_to_postgres(const char *json_metadata, const char *jso
         return false;
     }
 
-    // Check and create table if it does not exist
+    /* Check and create table if it does not exist */
     if (!check_and_create_table(conn, collection)) {
         fprintf(stderr, "Failed to create or check table\n");
         json_object_put(metadata_json);
@@ -271,7 +281,7 @@ bool execute_query_insert_to_postgres(const char *json_metadata, const char *jso
         return false;
     }
 
-    // Parse data JSON array
+    /* Parse data JSON array */
     struct json_object *data_array = json_tokener_parse(json_data_array);
     if (!data_array || json_object_get_type(data_array) != json_type_array) {
         fprintf(stderr, "Failed to parse data JSON array\n");
@@ -280,7 +290,7 @@ bool execute_query_insert_to_postgres(const char *json_metadata, const char *jso
         return false;
     }
 
-    // Execute insert queries
+    /* Execute insert queries */
     if (!execute_insert_queries(conn, collection, data_array, inserted_count)) {
         fprintf(stderr, "Failed to execute insert queries\n");
         json_object_put(metadata_json);
@@ -289,7 +299,7 @@ bool execute_query_insert_to_postgres(const char *json_metadata, const char *jso
         return false;
     }
 
-    // Clean up
+    /* Clean up */
     json_object_put(metadata_json);
     json_object_put(data_array);
     PQfinish(conn);
@@ -297,6 +307,8 @@ bool execute_query_insert_to_postgres(const char *json_metadata, const char *jso
     return true;
 }
 
+/* Executes delete queries for each JSON object in delete array from specified table.
+   Updates deleted count and returns true if all deletes were successful, false otherwise. */
 bool
 execute_delete_queries(PGconn *conn, const char *table_name, struct json_object *delete_array, int *deleted_count) {
     int array_length = json_object_array_length(delete_array);
@@ -306,6 +318,7 @@ execute_delete_queries(PGconn *conn, const char *table_name, struct json_object 
         struct json_object *delete_json = json_object_array_get_idx(delete_array, i);
         struct json_object *q_json, *limit_json;
 
+        /* Validate delete JSON format */
         if (!json_object_object_get_ex(delete_json, "q", &q_json) ||
             !json_object_object_get_ex(delete_json, "limit", &limit_json)) {
             fprintf(stderr, "Invalid delete JSON format\n");
@@ -315,7 +328,7 @@ execute_delete_queries(PGconn *conn, const char *table_name, struct json_object 
         const char *q_str = json_object_to_json_string_ext(q_json, JSON_C_TO_STRING_PLAIN);
         int limit = json_object_get_int(limit_json);
 
-        // Construct the JSONPath condition dynamically
+        /* Construct JSONPath condition dynamically */
         char jsonpath_condition[BUFFER_SIZE] = "$.** ? (";
         json_object_object_foreach(q_json, key, val)
         {
@@ -324,11 +337,11 @@ execute_delete_queries(PGconn *conn, const char *table_name, struct json_object 
             strncat(jsonpath_condition, condition_part, sizeof(jsonpath_condition) - strlen(jsonpath_condition) - 1);
         }
 
-        // Remove the trailing " && " and close the condition
+        /* Remove trailing " && " and close condition */
         jsonpath_condition[strlen(jsonpath_condition) - 4] = '\0';
         strncat(jsonpath_condition, ")", sizeof(jsonpath_condition) - strlen(jsonpath_condition) - 1);
 
-        // Construct the full query string
+        /* Construct full query string */
         char query[BUFFER_SIZE];
         if (limit == 0) {
             snprintf(query, sizeof(query), "DELETE FROM %s WHERE jsonb_path_exists(data, '%s')", table_name,
@@ -353,7 +366,12 @@ execute_delete_queries(PGconn *conn, const char *table_name, struct json_object 
     return true;
 }
 
+/* Connects to database, checks and creates the required table if it doesn't exist,
+   and executes delete queries for given data array.
+   Returns true if operation was successful, false otherwise. */
 bool execute_query_delete_to_postgres(const char *json_metadata, const char *json_data_array, int *deleted_count) {
+
+    /* Connect to initial database */
     PGconn *conn = PQconnectdb(PG_CONNINFO);
     if (PQstatus(conn) != CONNECTION_OK) {
         fprintf(stderr, "Connection to database failed: %s", PQerrorMessage(conn));
@@ -361,6 +379,7 @@ bool execute_query_delete_to_postgres(const char *json_metadata, const char *jso
         return false;
     }
 
+    /* Parse metadata JSON */
     struct json_object *metadata_json = json_tokener_parse(json_metadata);
     if (!metadata_json) {
         fprintf(stderr, "Failed to parse metadata JSON\n");
@@ -380,6 +399,7 @@ bool execute_query_delete_to_postgres(const char *json_metadata, const char *jso
     const char *collection = json_object_get_string(delete_obj);
     const char *dbname = json_object_get_string(db_obj);
 
+    /* Check and create database if it does not exist */
     if (!check_and_create_database(conn, dbname)) {
         fprintf(stderr, "Failed to create or check database\n");
         json_object_put(metadata_json);
@@ -389,6 +409,7 @@ bool execute_query_delete_to_postgres(const char *json_metadata, const char *jso
 
     PQfinish(conn);
 
+    /* Connect to specified database */
     char conninfo[BUFFER_SIZE];
     snprintf(conninfo, sizeof(conninfo), "dbname=%s user=user1 password=passwd port=5433", dbname);
     conn = PQconnectdb(conninfo);
@@ -399,6 +420,7 @@ bool execute_query_delete_to_postgres(const char *json_metadata, const char *jso
         return false;
     }
 
+    /* Check and create table if it does not exist */
     if (!check_and_create_table(conn, collection)) {
         fprintf(stderr, "Failed to create or check table\n");
         json_object_put(metadata_json);
@@ -406,6 +428,7 @@ bool execute_query_delete_to_postgres(const char *json_metadata, const char *jso
         return false;
     }
 
+    /* Parse delete JSON array */
     struct json_object *delete_array = json_tokener_parse(json_data_array);
     if (!delete_array || json_object_get_type(delete_array) != json_type_array) {
         fprintf(stderr, "Failed to parse delete JSON array\n");
@@ -414,6 +437,7 @@ bool execute_query_delete_to_postgres(const char *json_metadata, const char *jso
         return false;
     }
 
+    /* Execute delete queries */
     if (!execute_delete_queries(conn, collection, delete_array, deleted_count)) {
         fprintf(stderr, "Failed to execute delete queries\n");
         json_object_put(metadata_json);
@@ -422,6 +446,7 @@ bool execute_query_delete_to_postgres(const char *json_metadata, const char *jso
         return false;
     }
 
+    /* Clean up */
     json_object_put(metadata_json);
     json_object_put(delete_array);
     PQfinish(conn);
@@ -429,7 +454,8 @@ bool execute_query_delete_to_postgres(const char *json_metadata, const char *jso
     return true;
 }
 
-
+/* Builds JSONPath condition from given JSON object.
+   Appends condition to jsonpath_condition. */
 void build_jsonb_path_condition(struct json_object *q_json, char *jsonpath_condition) {
     strcat(jsonpath_condition, "$.** ? (");
 
@@ -440,11 +466,13 @@ void build_jsonb_path_condition(struct json_object *q_json, char *jsonpath_condi
         strncat(jsonpath_condition, condition_part, sizeof(jsonpath_condition) - strlen(jsonpath_condition) - 1);
     }
 
-    // Remove the trailing " && " and close the condition
+    /* Remove trailing " && " and close condition */
     jsonpath_condition[strlen(jsonpath_condition) - 4] = '\0';
     strncat(jsonpath_condition, ")", sizeof(jsonpath_condition) - strlen(jsonpath_condition) - 1);
 }
 
+/* Builds JSON path from given key.
+   Appends path to provided path variable. */
 void build_jsonb_path(const char *key, char *path) {
     const char *delimiter = ".";
     char *key_copy = strdup(key);
@@ -457,12 +485,14 @@ void build_jsonb_path(const char *key, char *path) {
         token = strtok(NULL, delimiter);
     }
 
-    // Remove the trailing comma and space
+    /* Remove trailing comma and space */
     path[strlen(path) - 2] = '\0';
 
     free(key_copy);
 }
 
+/* Executes update queries for each JSON object in update array from specified table.
+   Updates updated count and returns true if all updates were successful, false otherwise. */
 bool
 execute_update_queries(PGconn *conn, const char *table_name, struct json_object *update_array, int *updated_count) {
     int array_length = json_object_array_length(update_array);
@@ -472,6 +502,7 @@ execute_update_queries(PGconn *conn, const char *table_name, struct json_object 
         struct json_object *update_json = json_object_array_get_idx(update_array, i);
         struct json_object *q_json, *u_json, *multi_json;
 
+        /* Validate update JSON format */
         if (!json_object_object_get_ex(update_json, "q", &q_json) ||
             !json_object_object_get_ex(update_json, "u", &u_json)) {
             fprintf(stderr, "Invalid update JSON format at index %d\n", i);
@@ -480,12 +511,14 @@ execute_update_queries(PGconn *conn, const char *table_name, struct json_object 
 
         const char *q_str = json_object_to_json_string_ext(q_json, JSON_C_TO_STRING_PLAIN);
 
+        /* Validate $set JSON format */
         struct json_object *set_json;
         if (!json_object_object_get_ex(u_json, "$set", &set_json)) {
             fprintf(stderr, "Invalid $set JSON format at index %d\n", i);
             return false;
         }
 
+        /* Initialize jsonb_set_clause */
         char jsonb_set_clause[BUFFER_SIZE * 10] = "";
         struct json_object_iterator it = json_object_iter_begin(set_json);
         struct json_object_iterator it_end = json_object_iter_end(set_json);
@@ -508,12 +541,12 @@ execute_update_queries(PGconn *conn, const char *table_name, struct json_object 
             json_object_iter_next(&it);
         }
 
-        // Remove the last ", "
+        /* Remove last ", " */
         if (strlen(jsonb_set_clause) > 0) {
             jsonb_set_clause[strlen(jsonb_set_clause) - 2] = '\0';
         }
 
-        // Build the condition using JSON path
+        /* Build condition using JSON path */
         char jsonpath_condition[BUFFER_SIZE * 10] = "";
         build_jsonb_path_condition(q_json, jsonpath_condition);
 
@@ -540,6 +573,9 @@ execute_update_queries(PGconn *conn, const char *table_name, struct json_object 
     return true;
 }
 
+/* Connects to database, checks and creates required table if it doesn't exist,
+   and executes update queries for given data array.
+   Returns true if operation was successful, false otherwise. */
 bool execute_query_update_to_postgres(const char *json_metadata, const char *json_data_array, int *updated_count) {
     PGconn *conn = PQconnectdb(PG_CONNINFO);
     if (PQstatus(conn) != CONNECTION_OK) {
@@ -548,6 +584,7 @@ bool execute_query_update_to_postgres(const char *json_metadata, const char *jso
         return false;
     }
 
+    /* Parse metadata JSON */
     struct json_object *metadata_json = json_tokener_parse(json_metadata);
     if (!metadata_json) {
         fprintf(stderr, "Failed to parse metadata JSON\n");
@@ -567,6 +604,7 @@ bool execute_query_update_to_postgres(const char *json_metadata, const char *jso
     const char *collection = json_object_get_string(update_obj);
     const char *dbname = json_object_get_string(db_obj);
 
+    /* Check and create database if it does not exist */
     if (!check_and_create_database(conn, dbname)) {
         fprintf(stderr, "Failed to create or check database\n");
         json_object_put(metadata_json);
@@ -586,6 +624,7 @@ bool execute_query_update_to_postgres(const char *json_metadata, const char *jso
         return false;
     }
 
+    /* Check and create table if it does not exist */
     if (!check_and_create_table(conn, collection)) {
         fprintf(stderr, "Failed to create or check table\n");
         json_object_put(metadata_json);
@@ -593,6 +632,7 @@ bool execute_query_update_to_postgres(const char *json_metadata, const char *jso
         return false;
     }
 
+    /* Parse update JSON array */
     struct json_object *update_array = json_tokener_parse(json_data_array);
     if (!update_array || json_object_get_type(update_array) != json_type_array) {
         fprintf(stderr, "Failed to parse update JSON array\n");
@@ -601,6 +641,7 @@ bool execute_query_update_to_postgres(const char *json_metadata, const char *jso
         return false;
     }
 
+    /* Execute update queries */
     if (!execute_update_queries(conn, collection, update_array, updated_count)) {
         fprintf(stderr, "Failed to execute update queries\n");
         json_object_put(metadata_json);
@@ -609,6 +650,7 @@ bool execute_query_update_to_postgres(const char *json_metadata, const char *jso
         return false;
     }
 
+    /* Clean up */
     json_object_put(metadata_json);
     json_object_put(update_array);
     PQfinish(conn);
@@ -616,7 +658,8 @@ bool execute_query_update_to_postgres(const char *json_metadata, const char *jso
     return true;
 }
 
-
+/* Executes find query on specified table with given filter conditions.
+   Stores results in results parameter. */
 bool
 execute_find_query(PGconn *conn, const char *table_name, struct json_object *find_json, struct json_object **results) {
     struct json_object *filter_json, *limit_json;
@@ -624,12 +667,12 @@ execute_find_query(PGconn *conn, const char *table_name, struct json_object *fin
     int limit = -1;
     bool has_nested_field = false;
 
-    // Parse filter conditions from the JSON
+    /* Parse filter conditions from JSON */
     if (json_object_object_get_ex(find_json, "filter", &filter_json)) {
         struct json_object_iterator it = json_object_iter_begin(filter_json);
         struct json_object_iterator it_end = json_object_iter_end(filter_json);
 
-        // Check if there are any nested fields
+        /* Check if there are any nested fields */
         while (!json_object_iter_equal(&it, &it_end)) {
             const char *field_name = json_object_iter_peek_name(&it);
             if (strchr(field_name, '.')) {
@@ -641,7 +684,7 @@ execute_find_query(PGconn *conn, const char *table_name, struct json_object *fin
 
         it = json_object_iter_begin(filter_json);
         if (!has_nested_field) {
-            // Simple fields logic
+            /* Simple fields logic */
             while (!json_object_iter_equal(&it, &it_end)) {
                 const char *field_name = json_object_iter_peek_name(&it);
                 struct json_object *field_value = json_object_iter_peek_value(&it);
@@ -658,12 +701,12 @@ execute_find_query(PGconn *conn, const char *table_name, struct json_object *fin
                 json_object_iter_next(&it);
             }
 
-            // Remove the last " AND "
+            /* Remove last " AND " */
             if (strlen(condition) > 0) {
                 condition[strlen(condition) - 5] = '\0';
             }
         } else {
-            // Nested fields logic
+            /* Nested fields logic */
             while (!json_object_iter_equal(&it, &it_end)) {
                 const char *field_name = json_object_iter_peek_name(&it);
                 struct json_object *field_value = json_object_iter_peek_value(&it);
@@ -679,16 +722,19 @@ execute_find_query(PGconn *conn, const char *table_name, struct json_object *fin
                 json_object_iter_next(&it);
             }
 
+            /* Remove last " AND " */
             if (strlen(condition) > 0) {
                 condition[strlen(condition) - 5] = '\0';
             }
         }
     }
 
+    /* Parse limit from the JSON */
     if (json_object_object_get_ex(find_json, "limit", &limit_json)) {
         limit = json_object_get_int(limit_json);
     }
 
+    /* Construct SQL query */
     char query[BUFFER_SIZE];
     if (strlen(condition) > 0) {
         if (limit > 0) {
@@ -711,7 +757,7 @@ execute_find_query(PGconn *conn, const char *table_name, struct json_object *fin
         return false;
     }
 
-    // Process the query results
+    /* Process query results */
     int rows = PQntuples(res);
     *results = json_object_new_array();
 
@@ -726,8 +772,11 @@ execute_find_query(PGconn *conn, const char *table_name, struct json_object *fin
     return true;
 }
 
-bool execute_query_find_to_postgres(const char *json_metadata, struct json_object **results, const char **collection,
-                                    const char **dbname) {
+/* Connects to database, checks and creates required table if it doesn't exist,
+   and executes find query for given metadata.
+   Stores results and returns true if operation was successful, false otherwise. */
+bool execute_query_find_to_postgres(const char *json_metadata, struct json_object **results, char **collection,
+                                    char **dbname) {
     PGconn *conn = PQconnectdb(PG_CONNINFO);
     if (PQstatus(conn) != CONNECTION_OK) {
         fprintf(stderr, "Connection to database failed: %s", PQerrorMessage(conn));
@@ -798,9 +847,6 @@ bool execute_query_find_to_postgres(const char *json_metadata, struct json_objec
         return false;
     }
 
-    int array_length = json_object_array_length(*results);
-    int inserted_count = 0;
-
     json_object_put(metadata_json);
     json_object_put(find_json);
     PQfinish(conn);
@@ -808,7 +854,8 @@ bool execute_query_find_to_postgres(const char *json_metadata, struct json_objec
     return true;
 }
 
-
+/* Processes incoming message and performs corresponding database operations
+   based on message type identified in buffer. */
 void
 process_message(uint32_t response_to,
                 unsigned char *buffer,
@@ -920,7 +967,6 @@ typedef struct {
     char stack[STACK_SIZE];
 } client_t;
 
-
 void coroutine_entry_point(void *arg) {
     client_t *client = (client_t *) arg;
     struct ev_loop *loop = ev_default_loop(0);
@@ -928,10 +974,10 @@ void coroutine_entry_point(void *arg) {
     ev_io_init(&client->io, read_cb, client->fd, EV_READ);
     ev_io_start(loop, &client->io);
 
-    // Передаем управление обратно в главный контекст
+    // Transfer control back to main context
     coro_transfer(&client->ctx, &client->main_ctx);
 
-    // Запускаем цикл событий для обработки клиента
+    // Start event loop to handle client events
     ev_run(loop, 0);
 
     close(client->fd);
@@ -953,10 +999,10 @@ void accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     client_t *client = (client_t *) malloc(sizeof(client_t));
     client->fd = client_sd;
 
+    // Initialize coroutine for client handling
     coro_create(&client->ctx, coroutine_entry_point, client, client->stack, STACK_SIZE);
     coro_transfer(&client->main_ctx, &client->ctx);
 }
-
 
 int main_proxy(void) {
     struct ev_loop *loop = ev_default_loop(0);
@@ -994,8 +1040,6 @@ int main_proxy(void) {
 
     ev_io_init(&w_accept, accept_cb, server_sd, EV_READ);
     ev_io_start(loop, &w_accept);
-    //ev_signal_init(&signal_watcher, handle_sigterm, SIGTERM);
-    //ev_signal_start(loop, &signal_watcher);
 
     ev_loop(loop, 0);
 
@@ -1010,13 +1054,6 @@ void cleanup_and_exit(struct ev_loop *loop, int server_sd) {
     ev_loop_destroy(loop);
     exit(0);
 }
-
-/*
-void handle_sigterm(struct ev_loop *loop, ev_signal *w, int revents) {
-    elog(WARNING, "Received SIGTERM, shutting down...");
-    ev_break(loop, EVBREAK_ALL);
-}
-*/
 
 void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
     unsigned char buffer[BUFFER_SIZE];
@@ -1041,15 +1078,11 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
                                                 "\000\000\360?\000";
 
     unsigned char response[] = "I\001\000\000~\001\000\000\003\000\000\000\001\000\000\000\b\000\000\000\000\000\000\000\000\000\000\000\000\000\000\000\001\000\000\000%\001\000\000\bhelloOk\000\001\bismaster\000\001\003topologyVersion\000-\000\000\000\aprocessId\000f\225\335\246B(\\C\202\2468\351\022counter\000\000\000\000\000\000\000\000\000\000\020maxBsonObjectSize\000\000\000\000\001\020maxMessageSizeBytes\000\000l\334\002\020maxWriteBatchSize\000\240\206\001\000\tlocalTime\000\032T\246\271\220\001\000\000\020logicalSessionTimeoutMinutes\000\036\000\000\000\020connectionId\000*\000\000\000\020minWireVersion\000\000\000\000\000\020maxWireVersion\000\025\000\000\000\breadOnly\000\000\001ok\000\000\000\000\000\000\000\360?";
-    unsigned char msg_response[] = "&\000\000\000\006\000\000\000\001\000\000\000\335\a\000\000\000\000\000\000\000\021\000\000\000\001ok\000\000\000\000\000\000\000\360?";
-    unsigned char ok_query_response[] = "-\000\000\000\a\000\000\000\t\000\000\000\335\a\000\000\000\000\000\000\000\030\000\000\000\020n\000\001\000\000\000\001ok\000\000\000\000\000\000\000\360?";
-
 
     if (EV_ERROR & revents) {
         perror("got invalid event");
         return;
     }
-
 
     read = recv(watcher->fd, buffer, BUFFER_SIZE, 0);
 
@@ -1065,12 +1098,10 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
         return;
     }
 
-
     msg_length = ((u_int32_t *) buffer)[0];
     request_id = ((u_int32_t *) buffer)[1];
     response_to = ((u_int32_t *) buffer)[2];
     op_code = ((u_int32_t *) buffer)[3];
-
 
     switch (op_code) {
         case OP_QUERY:
@@ -1099,32 +1130,26 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
             process_message(request_id, buffer, *query_string, *parameter_string, &flag, &results, dbname, collection,
                             &changed_count);
             if (flag == 2) {
-                //REPLY MODIFIED
                 elog(WARNING, "send ping");
                 modify_ping_endsessions_reply(ping_endsessions_ok, request_id);
-                //send(watcher->fd, msg_response, sizeof(msg_response), 0);
                 send(watcher->fd, ping_endsessions_ok, PING_ENDSESSIONS_REPLY_LEN, 0);
             }
             if (flag == 3) {
-                //REPLY MODIFIED
                 elog(WARNING, "send insert");
                 modify_insert_delete_reply(insert_delete_ok, request_id, changed_count);
                 send(watcher->fd, insert_delete_ok, INSERT_DELETE_REPLY_LEN, 0);
             }
             if (flag == 6) {
-                //REPLY MODIFIED
                 elog(WARNING, "send delete");
                 modify_insert_delete_reply(insert_delete_ok, request_id, changed_count);
                 send(watcher->fd, insert_delete_ok, INSERT_DELETE_REPLY_LEN, 0);
             }
             if (flag == 8) {
-                //REPLY MODIFIED
                 elog(WARNING, "send update");
                 modify_update_reply(update_ok, response_to, changed_count);
                 send(watcher->fd, update_ok, UPDATE_REPLY_LEN, 0);
             }
             if (flag == 10) {
-                //REPLY MODIFIED
                 elog(WARNING, "send find");
                 unsigned char find_reply[BUFFER_SIZE];
                 memset(find_reply, 0, BUFFER_SIZE);
@@ -1136,31 +1161,23 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
                 json_object_put(results);
             }
             if (flag == 5) {
-                //REPLY MODIFIED
                 elog(WARNING, "terminate session");
                 modify_ping_endsessions_reply(ping_endsessions_ok, request_id);
                 send(watcher->fd, ping_endsessions_ok, PING_ENDSESSIONS_REPLY_LEN, 0);
             }
-
             if (*query_string != NULL) {
                 free(*query_string);
             }
             if (*parameter_string != NULL) {
                 free(*parameter_string);
             }
-            if (query_string != NULL) {
-                free(query_string);
-            }
-            if (parameter_string != NULL) {
-                free(parameter_string);
-            }
-
+            free(query_string);
+            free(parameter_string);
             free(*dbname);
             free(*collection);
             free(dbname);
             free(collection);
             break;
-
 
         case OP_REPLY:
             /* code */
@@ -1172,13 +1189,6 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
 
     memset(buffer, 0, BUFFER_SIZE);
 
-
-}
-
-void write_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
-    ev_io_stop(loop, watcher);
-    close(watcher->fd);
-    free(watcher);
 }
 
 void _PG_init(void) {
