@@ -22,7 +22,7 @@
 PG_MODULE_MAGIC;
 #endif
 
-#define MONGO_PORT 3427
+#define MONGO_PORT 3430
 #define BUFFER_SIZE 1024 * 3
 #define OP_QUERY 2004
 #define OP_REPLY 1
@@ -616,6 +616,7 @@ bool execute_query_update_to_postgres(const char *json_metadata, const char *jso
     return true;
 }
 
+
 bool
 execute_find_query(PGconn *conn, const char *table_name, struct json_object *find_json, struct json_object **results) {
     struct json_object *filter_json, *limit_json;
@@ -678,38 +679,34 @@ execute_find_query(PGconn *conn, const char *table_name, struct json_object *fin
                 json_object_iter_next(&it);
             }
 
-            // Remove the last " AND "
             if (strlen(condition) > 0) {
                 condition[strlen(condition) - 5] = '\0';
             }
         }
     }
 
-    // Parse limit from the JSON
     if (json_object_object_get_ex(find_json, "limit", &limit_json)) {
         limit = json_object_get_int(limit_json);
     }
 
-    // Construct the SQL query
     char query[BUFFER_SIZE];
     if (strlen(condition) > 0) {
         if (limit > 0) {
-            snprintf(query, sizeof(query), "SELECT * FROM %s WHERE %s LIMIT %d", table_name, condition, limit);
+            snprintf(query, sizeof(query), "SELECT data FROM %s WHERE %s LIMIT %d", table_name, condition, limit);
         } else {
-            snprintf(query, sizeof(query), "SELECT * FROM %s WHERE %s", table_name, condition);
+            snprintf(query, sizeof(query), "SELECT data FROM %s WHERE %s", table_name, condition);
         }
     } else {
         if (limit > 0) {
-            snprintf(query, sizeof(query), "SELECT * FROM %s LIMIT %d", table_name, limit);
+            snprintf(query, sizeof(query), "SELECT data FROM %s LIMIT %d", table_name, limit);
         } else {
-            snprintf(query, sizeof(query), "SELECT * FROM %s", table_name);
+            snprintf(query, sizeof(query), "SELECT data FROM %s", table_name);
         }
     }
 
-
     PGresult *res = PQexec(conn, query);
     if (PQresultStatus(res) != PGRES_TUPLES_OK) {
-        fprintf(stderr, "INSERT command failed: %s", PQerrorMessage(conn));
+        fprintf(stderr, "SELECT command failed: %s", PQerrorMessage(conn));
         PQclear(res);
         return false;
     }
@@ -719,18 +716,10 @@ execute_find_query(PGconn *conn, const char *table_name, struct json_object *fin
     *results = json_object_new_array();
 
     for (int i = 0; i < rows; i++) {
-        struct json_object *row_obj = json_object_new_object();
-        int n_fields = PQnfields(res);
+        const char *field_value = PQgetvalue(res, i, 0);
 
-        for (int j = 0; j < n_fields; j++) {
-            const char *field_name = PQfname(res, j);
-            const char *field_value = PQgetvalue(res, i, j);
-
-            // Assume all fields are JSONB and parse accordingly
-            struct json_object *json_value = json_tokener_parse(field_value);
-            json_object_object_add(row_obj, field_name, json_value);
-        }
-        json_object_array_add(*results, row_obj);
+        struct json_object *json_value = json_tokener_parse(field_value);
+        json_object_array_add(*results, json_value);
     }
 
     PQclear(res);
