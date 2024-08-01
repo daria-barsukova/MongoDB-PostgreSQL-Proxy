@@ -21,7 +21,7 @@
 PG_MODULE_MAGIC;
 #endif
 
-#define MONGO_PORT 3482
+#define MONGO_PORT 3463
 #define BUFFER_SIZE 1024 * 3
 #define OP_QUERY 2004
 #define OP_REPLY 1
@@ -85,7 +85,7 @@ bool execute_query_find_to_postgres(const char *json_metadata, struct json_objec
 
 void cleanup_and_exit(struct ev_loop *loop, int server_sd);
 
-static void handle_sigterm(SIGNAL_ARGS, int server_sd);
+static void handle_sigterm(int sig, int server_sd);
 
 void random_new_req_id(unsigned char *buffer);
 
@@ -95,22 +95,23 @@ void modify_ping_endsessions_reply(unsigned char *reply, u_int32_t response_to);
 
 void modify_update_reply(unsigned char *reply, u_int32_t response_to, int nmodified);
 
-int get_type_of_value(struct json_object *field_value);
-
-int generate_subelemets_string(struct json_object *single_json, char *reply);
-
-int generate_first_batch_element_i(struct json_object *single_json, char *reply, int number_of_el);
-
-int generate_first_batch(struct json_object *data_array, char *reply);
-
 void random_new_req_id(unsigned char *buffer);
 
-int generate_find_reply_packet(struct json_object *data_array, char *reply, uint32_t response_to, char *db_name,
-                               char *table_name);
-
+int reply_find_generate_array_element_i(struct json_object *data_json, char *buffer, int place_to_put, int number_of_el);
+int generate_find_reply_packet(struct json_object *data_array, char *reply, uint32_t response_to, char *db_name, char *table_name);
 int generate_cursor(struct json_object *data_array, char *reply, char *db_name, char *table_name);
-
 int generate_ns_element(char *reply, char *db_name, char *table_name);
+void reply_find_process_string(const char *field_str, const char *value_str, char *buffer, int *now_to_put);
+void reply_find_process_int32(const char *field_str, const char *value_str, char *buffer, int *now_to_put);
+void reply_find_process_boolean(const char *field_str, const char *value_str, char *buffer, int *now_to_put);
+void reply_find_process_double(const char *field_str, const char *value_str, char *buffer, int *now_to_put);
+int reply_find_process_array(const char *field_str, struct json_object *data_json, char *buffer, int place_to_put);
+int reply_find_generate_subelemets_string(struct json_object *data_json, char *buffer, int place_to_put);
+int get_type_of_value(struct json_object *field_value);
+int reply_find_process_object(const char *field_str, struct json_object *data_json, char *buffer, int place_to_put);
+int reply_find_process_oid(const char *field_str, struct json_object *data_json, char *buffer, int place_to_put);
+
+
 
 /* Signal handler for SIGTERM to gracefully close the server socket and exit. */
 static void handle_sigterm(int sig, int server_sd) {
@@ -370,15 +371,17 @@ execute_delete_queries(PGconn *conn, const char *table_name, struct json_object 
    and executes delete queries for given data array.
    Returns true if operation was successful, false otherwise. */
 bool execute_query_delete_to_postgres(const char *json_metadata, const char *json_data_array, int *deleted_count) {
-
+    elog(WARNING, "line: %d", __LINE__);
     /* Connect to initial database */
     PGconn *conn = PQconnectdb(PG_CONNINFO);
+    elog(WARNING, "line: %d", __LINE__);
     if (PQstatus(conn) != CONNECTION_OK) {
+        elog(WARNING, "line: %d", __LINE__);
         fprintf(stderr, "Connection to database failed: %s", PQerrorMessage(conn));
         PQfinish(conn);
         return false;
     }
-
+    elog(WARNING, "line: %d", __LINE__);
     /* Parse metadata JSON */
     struct json_object *metadata_json = json_tokener_parse(json_metadata);
     if (!metadata_json) {
@@ -386,6 +389,7 @@ bool execute_query_delete_to_postgres(const char *json_metadata, const char *jso
         PQfinish(conn);
         return false;
     }
+    elog(WARNING, "line: %d", __LINE__);
 
     struct json_object *delete_obj, *db_obj;
     if (!json_object_object_get_ex(metadata_json, "delete", &delete_obj) ||
@@ -881,7 +885,7 @@ process_message(uint32_t response_to,
         return;
     }
 
-    elog(WARNING, "before ping check");
+
     if (buffer[26] == 'p') {
         *flag = 2;
         elog(WARNING, "ping");
@@ -889,13 +893,14 @@ process_message(uint32_t response_to,
         return;
     }
 
+
     if (buffer[26] == 'e') {
         *flag = 5;
         elog(WARNING, "end session");
         memset(buffer, 0, BUFFER_SIZE);
         return;
     }
-
+    
     if (buffer[26] == 'i') {
         int inserted_count = 0;
         if (execute_query_insert_to_postgres(json_metadata, json_data_array, &inserted_count)) {
@@ -911,6 +916,7 @@ process_message(uint32_t response_to,
             return;
         }
     }
+    
     if (buffer[26] == 'd') {
         int deleted_count = 0;
         if (execute_query_delete_to_postgres(json_metadata, json_data_array, &deleted_count)) {
@@ -926,6 +932,7 @@ process_message(uint32_t response_to,
             return;
         }
     }
+    
     if (buffer[26] == 'u') {
         elog(WARNING, "че там лежит в запросе %s", json_data_array);
         int updated_count = 0;
@@ -942,6 +949,7 @@ process_message(uint32_t response_to,
             return;
         }
     }
+    
     if (buffer[26] == 'f') {
         //struct json_object *results;
         if (execute_query_find_to_postgres(json_metadata, results, collection, dbname)) {
@@ -1109,6 +1117,7 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
             elog(WARNING, "send reply");
             random_new_req_id(response);
             send(watcher->fd, response, sizeof(response), 0);
+            elog(WARNING, "reply was sent");
             break;
         case OP_MSG:
 
@@ -1133,54 +1142,65 @@ void read_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
                 elog(WARNING, "send ping");
                 modify_ping_endsessions_reply(ping_endsessions_ok, request_id);
                 send(watcher->fd, ping_endsessions_ok, PING_ENDSESSIONS_REPLY_LEN, 0);
+                elog(WARNING, "ping was sent");
             }
             if (flag == 3) {
                 elog(WARNING, "send insert");
                 modify_insert_delete_reply(insert_delete_ok, request_id, changed_count);
                 send(watcher->fd, insert_delete_ok, INSERT_DELETE_REPLY_LEN, 0);
+                elog(WARNING, "insert was sent");
             }
             if (flag == 6) {
                 elog(WARNING, "send delete");
                 modify_insert_delete_reply(insert_delete_ok, request_id, changed_count);
                 send(watcher->fd, insert_delete_ok, INSERT_DELETE_REPLY_LEN, 0);
+                elog(WARNING, "delete was sent");
             }
             if (flag == 8) {
                 elog(WARNING, "send update");
                 modify_update_reply(update_ok, response_to, changed_count);
                 send(watcher->fd, update_ok, UPDATE_REPLY_LEN, 0);
+                elog(WARNING, "update was sent");
             }
             if (flag == 10) {
                 elog(WARNING, "send find");
-                unsigned char find_reply[BUFFER_SIZE];
+                //char find_reply[BUFFER_SIZE];
+                char *find_reply = (char *)malloc(BUFFER_SIZE);
                 memset(find_reply, 0, BUFFER_SIZE);
                 int find_reply_len = generate_find_reply_packet(results, find_reply, 0x06, *dbname, *collection);
                 if (find_reply_len == -1) {
                     elog(WARNING, "generate_find_reply_packet got an error");
                 }
                 send(watcher->fd, find_reply, find_reply_len, 0);
+                
+                free(find_reply);
                 json_object_put(results);
+                elog(WARNING, "find was sent");
             }
             if (flag == 5) {
                 elog(WARNING, "terminate session");
                 modify_ping_endsessions_reply(ping_endsessions_ok, request_id);
                 send(watcher->fd, ping_endsessions_ok, PING_ENDSESSIONS_REPLY_LEN, 0);
+                elog(WARNING, "session was terminated");
             }
+            
             if (*query_string != NULL) {
                 free(*query_string);
             }
             if (*parameter_string != NULL) {
                 free(*parameter_string);
             }
-            free(query_string);
-            free(parameter_string);
+            if (query_string != NULL) {
+                free(query_string);
+            }
+            if (parameter_string != NULL) {
+                free(parameter_string);
+            }
+            
             free(*dbname);
             free(*collection);
             free(dbname);
             free(collection);
-            break;
-
-        case OP_REPLY:
-            /* code */
             break;
         default:
             perror("UNKNOWN OP_CODE\n");
@@ -1421,8 +1441,17 @@ void modify_update_reply(unsigned char *reply, u_int32_t response_to, int nmodif
 }
 
 
-int generate_find_reply_packet(struct json_object *data_array, char *reply, uint32_t response_to, char *db_name,
-                               char *table_name) {
+/**
+ * generates the find reply packet
+ * arguments: data_array - json having args to answer
+ *      reply - buffer to put the Mongodb protocol packet
+ *      db_name, table_name - names of db and table where we got data_array from
+ * 
+ * returns lentgs of the packet in bytes if everything is good
+ * if smth went wrong, returns -1
+ */
+int generate_find_reply_packet(struct json_object *data_array, 
+    char *reply, uint32_t response_to, char *db_name, char *table_name) {
     /**
      * structure of find_reply_packet:
      * [0 - 3] message length
@@ -1442,20 +1471,26 @@ int generate_find_reply_packet(struct json_object *data_array, char *reply, uint
      * [... + 1] = 0 end of the BodyDocument
      * //end of the Section
      */
+
+    int doc_size = 4;
+    char cursor_buffer[BUFFER_SIZE];
+    int cursor_size;
+
     int message_lenght = 0;
     random_new_req_id(reply); //[4 - 7] request_id
-    ((uint32_t * )(reply))[2] = response_to;
+    ((uint32_t *)(reply))[2] = response_to;
     memcpy(reply + 12, "\335\a\000\000", 4); //opcode
     memcpy(reply + 19, "\000\000\000\000", 4);
     reply[20] = 0;
 
 
-    int doc_size = 4; // for
+    
 
-    char cursor_buffer[BUFFER_SIZE];
+    
     memset(cursor_buffer, 0, BUFFER_SIZE);
-    int cursor_size = generate_cursor(data_array, cursor_buffer, db_name, table_name);
+    cursor_size = generate_cursor(data_array, cursor_buffer, db_name, table_name);
     if (cursor_size == -1) {
+        elog(WARNING, "generate_cursor got an error");
         return -1;
     }
 
@@ -1466,15 +1501,14 @@ int generate_find_reply_packet(struct json_object *data_array, char *reply, uint
     doc_size += 12;
     reply[21 + doc_size] = 0; //end of the BodyDocument
     doc_size++;
-
+    
 
     //setting the document size
-    ((uint32_t * )(reply + 21))[0] = doc_size;
-
+    ((uint32_t *)(reply + 21))[0] = doc_size;
 
     //setting the message length
     message_lenght += doc_size + 21;
-    ((uint32_t * )(reply))[0] = message_lenght;
+    ((uint32_t *)(reply))[0] = message_lenght;
 
     return message_lenght;
 }
@@ -1483,11 +1517,12 @@ int generate_find_reply_packet(struct json_object *data_array, char *reply, uint
 /**
  * return reply_size if everything is good
  * return -1 if something went wrong
+ * 
  */
 int generate_cursor(struct json_object *data_array, char *reply, char *db_name, char *table_name) {
     /**
      * struct of element: cursor
-     * [0] = 0x03 type: Document
+     * [0] = 0x03 type: Document 
      * [1-6] = "cursor"
      * [7] = 0
      * //then goes Document
@@ -1497,32 +1532,40 @@ int generate_cursor(struct json_object *data_array, char *reply, char *db_name, 
      * [... - ...] element: ns
      * [... + 1] = 0 - end of the Document
      */
+    
+    char first_batch_reply[BUFFER_SIZE];
+    char id[] = "\022id\000\000\000\000\000\000\000\000\000";
+    char ns_reply[BUFFER_SIZE];
+    int first_batch_size;
+    int ns_size;
 
     int now_to_put = 0;
     reply[0] = 0x03;
-    memcpy(reply + 1, "cursor", 6);
-    reply[7] = 0;
+    memcpy(reply + 1, "cursor", 7);
 
 
-    char first_batch_reply[BUFFER_SIZE];
+    
     memset(first_batch_reply, 0, BUFFER_SIZE);
-    int first_batch_size = generate_first_batch(data_array, first_batch_reply);
+    //LATER: CHANGE 0 (reply_find_process_array::place_to_put) TO now_to_put
+    first_batch_size = reply_find_process_array("firstBatch", data_array, first_batch_reply, 0);
     if (first_batch_size == -1) {
+        elog(WARNING, "reply_find_process_array got an error");
         return -1;
     }
+
     now_to_put = 12;
     memcpy(reply + now_to_put, first_batch_reply, first_batch_size);
     now_to_put += first_batch_size;
 
-    char id[] = "\022id\000\000\000\000\000\000\000\000\000";
+    
     memcpy(reply + now_to_put, id, 12);
-    now_to_put += 12;
+    now_to_put +=12;
 
-
-    char ns_reply[BUFFER_SIZE];
+    
     memset(ns_reply, 0, BUFFER_SIZE);
-    int ns_size = generate_ns_element(ns_reply, db_name, table_name);
+    ns_size = generate_ns_element(ns_reply, db_name, table_name);
     if (ns_size == -1) {
+        elog(WARNING, "generate_ns_element got an error");
         return -1;
     }
     memcpy(reply + now_to_put, ns_reply, ns_size);
@@ -1532,7 +1575,7 @@ int generate_cursor(struct json_object *data_array, char *reply, char *db_name, 
 
 
     //setting the Document length
-    ((uint32_t * )(reply + 8))[0] = now_to_put - 8;
+    ((uint32_t *)(reply + 8))[0] = now_to_put - 8;
     return now_to_put;
 }
 
@@ -1540,6 +1583,8 @@ int generate_cursor(struct json_object *data_array, char *reply, char *db_name, 
 /**
  * return reply_size if everything is good
  * return -1 if something went wrong
+ * 
+ * ns includes db_name and table_name we got data from
  */
 int generate_ns_element(char *reply, char *db_name, char *table_name) {
     /**
@@ -1549,7 +1594,7 @@ int generate_ns_element(char *reply, char *db_name, char *table_name) {
      * [3] = 0 (like end of string)
      * [4 - 7] = length of string
      * [8 - ...] = string (db_name.table_name) (it includes!!! 0 in the end of the string)
-     *
+     * 
      */
     int value_size = 0;
     reply[0] = 0x02;
@@ -1568,75 +1613,177 @@ int generate_ns_element(char *reply, char *db_name, char *table_name) {
     //bc 0 int hte end of the string must be included to the lenght of the string
     value_size++;
     //setting length of element
-    ((uint32_t * )(reply))[1] = value_size;
+    ((uint32_t *)(reply))[1] = value_size;
     return value_size + 8;
 }
 
+
 /**
- * return reply_size if everything is good
- * return -1 if something went wrong
+ * args: value_str - string to be placed to buffer
+ *          *now_to_put - start place in buffer to put
+ * *now_to_put would be changed during processing
  */
-int generate_first_batch(struct json_object *data_array, char *reply) {
+void reply_find_process_string(const char *field_str, const char *value_str, char *buffer, int *now_to_put) {
+    char lilbuf[4];
+
+    buffer[*now_to_put] = 0x02;
+    (*now_to_put)++;
+    //here we put name of the field
+    memcpy((buffer + *now_to_put), field_str, strlen(field_str) + 1); // copy field name to el
+    (*now_to_put) += strlen(field_str) + 1;
+    //here we put size of the field
+    
+    memset(lilbuf, 0, 4);
+    int my_len = strlen(value_str) + 1;
+    int num_16_digits = 0;
+    while (my_len != 0) {
+        my_len /= 256;
+        num_16_digits++;
+    }
+
+    my_len = strlen(value_str) + 1;
+
+    for(int i = 0; i < num_16_digits; i++) {
+        lilbuf[i] = my_len % 256;
+        my_len /= 256;
+    }
+    
+    for (int i = 0; i < 4; ++i) {
+        if (lilbuf[i]) {
+            buffer[*now_to_put + i] = lilbuf[i]; //- '0';
+        } else {
+            buffer[*now_to_put + i] = lilbuf[i];
+        }
+        
+    }
+    (*now_to_put) += 4;
+    //here we put field value
+    memcpy((buffer + *now_to_put), value_str, strlen(value_str));
+    *now_to_put += strlen(value_str);
+    buffer[*now_to_put] = 0;
+    (*now_to_put)++;
+}
+
+void reply_find_process_int32(const char *field_str, const char *value_str, char *buffer, int *now_to_put) {
+    //here we put type
+    buffer[*now_to_put] = 0x10; //16
+    (*now_to_put)++;
+    //here we put name of the field
+    memcpy((buffer + *now_to_put), field_str, strlen(field_str) + 1); // copy field name to el
+    (*now_to_put) += strlen(field_str) + 1;
+
+    //here we put field value
+    *(int32_t *)(&buffer[0] + *now_to_put) = (int32_t) atoi(value_str);
+    (*now_to_put) += 4;
+}
+
+void reply_find_process_boolean(const char *field_str, const char *value_str, char *buffer, int *now_to_put) {
+    //here we put type
+    buffer[*now_to_put] = 0x08; //16
+    (*now_to_put)++;
+    //here we put name of the field
+    memcpy((buffer + *now_to_put), field_str, strlen(field_str) + 1); // copy field name to el
+    (*now_to_put) += strlen(field_str) + 1;
+    //here we put field value
+    *(u_int8_t *)(&buffer[0] + *now_to_put) = (u_int8_t) atoi(value_str) > 0 ? 1 : 0;
+    (*now_to_put) += 1;
+}
+
+void reply_find_process_double(const char *field_str, const char *value_str, char *buffer, int *now_to_put) {
+    //here we put type
+    buffer[*now_to_put] = 0x01; //16
+    (*now_to_put)++;
+    //here we put name of the field
+    memcpy((buffer + *now_to_put), field_str, strlen(field_str) + 1); // copy field name to el
+    (*now_to_put) += strlen(field_str) + 1;
+    //here we put field value
+    *(int64_t *)(&buffer[0] + *now_to_put) = (int64_t) atoi(value_str);
+    (*now_to_put) += 8;
+}
+
+
+/**
+ * return number of written bytes
+ * arguments: field_str - name of array, 
+ *      data_json - json keepeng elements of the array, 
+ *      buffer to write answer to
+ *      place_to_put - start position in buffer to put elements
+ * 
+ * forms array as Mongodb protocol needs
+ */
+int reply_find_process_array(const char *field_str, 
+    struct json_object *data_json, char *buffer, int place_to_put) {
     /**
-     * struct of firstBatch
-     * [0] = 0x04 type: array
-     * [1-10] name of element: firstBatch
-     * [11] = 0
-     * //here Document starts
-     * [12-15] Document lenght
-     * //[16] = 0x03 type: Document
-     * element 0: (from generate_first_batch_element_i)
-     * ...
-     * element n-1:
-     * [last] = 0
+     * struct
+     * 
+     * buffer + place_to_put = 0 place
+     * [0] = type
+     * [1 - strlen(fieldstr) + 1] = name of the array (in must include 0 in the end of the string )
+     * [strlen(fieldstr) + 1 - strlen(fieldstr) + 4] length of the doc
+     * then elements ...
+     * [last] = 0 - 0 of the doc
+     * MAYBE ONE MORE 0 (CHECK LATER!!!)
      */
-    int now_to_put = 0;
-    reply[0] = 0x04;
-    char firstBatch[] = "firstBatch";
-    memcpy(reply + 1, firstBatch, 10);
-    reply[11] = 0;
-    now_to_put = 16;
 
+    int place_for_doc_length;
+    int array_length;
     char el_reply[BUFFER_SIZE];
+    struct json_object *el_json;
+    int el_i_size;
 
+    int start_place_to_put = place_to_put;
+    //here we put type
+    buffer[place_to_put] = 0x04;
+    place_to_put++;
+    //here we put name of the field
+    memcpy((buffer + place_to_put), field_str, strlen(field_str) + 1); // copy field name to el
+    place_to_put += strlen(field_str) + 1;
+    place_for_doc_length = place_to_put;
+    place_to_put += 4;
+    
+    array_length = json_object_array_length(data_json);
 
-    int array_length = json_object_array_length(data_array);
-
+    
     /**
      * we go throw data_array (thow all jsons we have), process them and add result to our reply
      */
     if (array_length > 0) {
         for (int i = 0; i < array_length; i++) {
-            struct json_object *data_json = json_object_array_get_idx(data_array, i);
+            el_json = json_object_array_get_idx(data_json, i);
 
+            //LATER
+            //CHANGE ON MAIN BUFFER!!!!!
             memset(el_reply, 0, BUFFER_SIZE);
-            int el_i_size = generate_first_batch_element_i(data_json, el_reply, i);
+            el_i_size = reply_find_generate_array_element_i(el_json, el_reply, 0, i);
             if (el_i_size == -1) {
                 //everything is bad
+                elog(WARNING, "reply_find_generate_array_element_i got an error");
                 return -1;
             }
-            memcpy(reply + now_to_put, el_reply, el_i_size);
-            now_to_put += el_i_size;
 
+            memcpy(buffer + place_to_put, el_reply, el_i_size);
+            place_to_put += el_i_size;
+            json_object_put(el_json);
         }
     }
 
-
-    reply[now_to_put] = 0;
-    //this was added for testing answers for empty find. for not empty find that wasn't needed
-    now_to_put++;
-
-    //setting the Document lenght
-    ((uint32_t * )(reply + 12))[0] = now_to_put - 12;
-
-    return now_to_put;
+    buffer[place_to_put] = 0;
+    place_to_put++;
+    ((u_int32_t *)(buffer + place_for_doc_length))[0] = (u_int32_t) place_to_put - place_for_doc_length;
+    return place_to_put - start_place_to_put;
 }
 
+
 /**
- * return reply_size if everything is good
- * return -1 if something went wrong
+ * return number of written bytes
+ * arguments: data_json - json keepeng i element of the array, 
+ *      buffer to write answer to
+ *      place_to_put - start position in buffer to put elements
+ *      num_of_element = i
+ * 
+ * forms i element of array
  */
-int generate_first_batch_element_i(struct json_object *single_json, char *reply, int number_of_el) {
+int reply_find_generate_array_element_i(struct json_object *data_json, char *buffer, int place_to_put, int number_of_el) {
     /**
      * structure of element: i
      * [0](byte) type: Document (0x03)
@@ -1646,13 +1793,19 @@ int generate_first_batch_element_i(struct json_object *single_json, char *reply,
      * [7-...]then elements we got from generate_subelemets_string()
      * [... + 1]byte = 0
      */
-    int place_for_answer = 7;
-    int now_to_put = 0;
-    reply[now_to_put] = 0x03;
-    now_to_put++;
+    
+    char answer[BUFFER_SIZE];
+    int ne_copy;
+    int digits_number;
+    int reply_size;
+    int ans_size;
+
+    int start_place_to_put = place_to_put;
+    buffer[place_to_put] = 0x03;
+    place_to_put++;
     //reply[1] = (char)(0x30 + number_of_el);
-    int ne_copy = number_of_el;
-    int digits_number = 0;
+    ne_copy = number_of_el;
+    digits_number = 0;
     if (number_of_el == 0) {
         digits_number = 1;
     } else {
@@ -1664,183 +1817,31 @@ int generate_first_batch_element_i(struct json_object *single_json, char *reply,
 
 
     ne_copy = number_of_el;
-    for (int i = now_to_put + digits_number - 1; i >= now_to_put; i--) {
-        reply[i] = (char) (0x30 + ne_copy % 10);
+    for (int i = place_to_put + digits_number - 1; i >= place_to_put; i--) {
+        buffer[i] = (char)(0x30 + ne_copy % 10); 
         ne_copy /= 10;
     }
-    now_to_put += digits_number;
-    reply[now_to_put] = 0;
-    now_to_put++;
-    //reply[1] = (char)(0x30 + number_of_el);
+    place_to_put += digits_number;
+    buffer[place_to_put] = 0;
+    place_to_put++;
 
-    //reply[2] = 0;
-
-    char answer[BUFFER_SIZE];
     memset(answer, 0, BUFFER_SIZE);
-    int ans_size = generate_subelemets_string(single_json, answer);
+    //LATER: CHANGE 0 (reply_find_generate_subelemets_string::place_to_put) TO place_to_put
+    ans_size = reply_find_generate_subelemets_string(data_json, answer, 0);
     if (ans_size < 0) {
+        elog(WARNING, "reply_find_generate_subelemets_string got an error");
         return -1;
     }
 
-    memcpy((reply + 6 + digits_number), answer, ans_size);
-    reply[6 + digits_number + ans_size] = 0;
+    memcpy((buffer + start_place_to_put + 6 + digits_number), answer, ans_size);
+    buffer[start_place_to_put + 6 + digits_number + ans_size] = 0;
 
     //counting reply_size
-    int reply_size = 6 + digits_number + ans_size + 1;
-    //setting the Document length (it is = reply_size - 3(at the start of the document))
-    ((uint32_t * )(reply + 2 + digits_number))[0] = reply_size - 2 - digits_number;
+    reply_size = 6 + digits_number + ans_size + 1;
+    //setting the Document length (it is = reply_size - 2(at the start of the document) - digits_number)
+    ((uint32_t *)(buffer + start_place_to_put + 2 + digits_number))[0] = reply_size - 2 - digits_number;
     return reply_size;
-
 }
-
-
-/**
- * return size of reply (bytes) if everything is fine
- * return -1 if something went wrong
- */
-int generate_subelemets_string(struct json_object *single_json, char *reply) {
-    /**
-     * structure
-     * type: 0x07 [0]
-     * element: _id [1-3]
-     * byte = 0 [4]
-     * ObjectID: ... [5-16]
-     * THIS PART WOULD ALWAYS BE THE SAME!!!
-     */
-    // char element_id[] = "\a_idf\237\037\246\266\037\020\2324\356\275\262";
-
-    char element_id[18];
-    element_id[0] = 0x07;
-    element_id[1] = 0x5f;
-    element_id[2] = 0x69;
-    element_id[3] = 0x64;
-    element_id[4] = 0x00;
-    element_id[5] = 0x66;
-    element_id[6] = 0x9f;
-    element_id[7] = 0x1f;
-    element_id[8] = 0xa6;
-    element_id[9] = 0xb6;
-    element_id[10] = 0x1f;
-    element_id[11] = 0x10;
-    element_id[12] = 0x9a;
-    element_id[13] = 0x34;
-    element_id[14] = 0xee;
-    element_id[15] = 0xbd;
-    element_id[16] = 0xb2;
-
-    int size_of_reply = 0;
-
-    memcpy(reply, element_id, 17);
-
-    size_of_reply += 17;
-
-    struct json_object_iterator it = json_object_iter_begin(single_json);
-    struct json_object_iterator it_end = json_object_iter_end(single_json);
-
-    /**
-     * meaningful element structure:
-     * type: type of value - 1 byte
-     * name of the field: - how much needed (it DOES end with '\0')
-     * lenght: 4 byte (ONLY if type is string)
-     * value:
-     */
-
-    while (!json_object_iter_equal(&it, &it_end)) {
-        char el[BUFFER_SIZE];
-        memset(el, 0, BUFFER_SIZE);
-        int real_size = 0;
-        int now_to_put = 0;
-
-        const char *field_str = json_object_iter_peek_name(&it);
-        struct json_object *value_json = json_object_iter_peek_value(&it);
-        const char *value_str = get_json_value_as_string(value_json);
-
-        //if there is an empty value, we do not send it
-        if (strcmp(value_str, "") == 0) {
-            json_object_iter_next(&it);
-            continue;
-        }
-
-        //here we go type
-        int type = get_type_of_value(value_json);
-        if (type == -1) {
-            return -1;
-        }
-
-        //here we put type
-        el[now_to_put] = type;
-        now_to_put++;
-        //here we put name of the field
-        memcpy((el + now_to_put), field_str, strlen(field_str) + 1); // copy field name to el
-        now_to_put += strlen(field_str) + 1;
-
-        //here we put size of the field (if needed) and field value
-        switch (type) {
-            case 2: //string
-                //here we put size of the field
-                char lilbuf[4];
-                memset(lilbuf, 0, 4);
-                int my_len = strlen(value_str) + 1;
-                int num_16_digits = 0;
-                while (my_len != 0) {
-                    my_len /= 256;
-                    num_16_digits++;
-                }
-
-                my_len = strlen(value_str) + 1;
-
-                for (int i = 0; i < num_16_digits; i++) {
-                    lilbuf[i] = my_len % 256;
-                    my_len /= 256;
-                }
-                //memcpy(el + now_to_put, lilbuf, 4);
-                for (int i = 0; i < 4; ++i) {
-                    if (lilbuf[i]) {
-                        el[now_to_put + i] = lilbuf[i]; //- '0';
-                    } else {
-                        el[now_to_put + i] = lilbuf[i];
-                    }
-
-                }
-                now_to_put += 4;
-                //here we put field value
-                memcpy((el + now_to_put), value_str, strlen(value_str));
-                now_to_put += strlen(value_str);
-                el[now_to_put] = 0;
-                now_to_put++;
-                break;
-            case 16: //int32
-                //here we put field value
-                *(int32_t * )(&el[0] + now_to_put) = (int32_t) atoi(value_str);
-                now_to_put += 4;
-                break;
-            case 8: //boolean
-                //here we put field value
-                *(u_int8_t * )(&el[0] + now_to_put) = (u_int8_t) atoi(value_str) > 0 ? 1 : 0;
-                now_to_put += 1;
-                break;
-            case 1: //double
-                //here we put field value
-                *(int64_t * )(&el[0] + now_to_put) = (int64_t) atoi(value_str);
-                now_to_put += 8;
-                break;
-            default:
-                elog(WARNING, "UNCKOWN TYPE IN JSON: %d\n", type);
-                return -1;
-        }
-        //here we think that el(element string) is built
-        real_size = now_to_put;
-
-        memcpy((reply + size_of_reply), el, real_size);
-        size_of_reply += real_size;
-
-
-        json_object_iter_next(&it);
-    }
-
-    return size_of_reply;
-}
-
 
 /**
  * return type of json_value
@@ -1850,6 +1851,9 @@ int generate_subelemets_string(struct json_object *single_json, char *reply) {
  * int32: 16 = 0x10
  * boolean: 8 = 0x08
  * double: 1 = 0x01
+ * object: 3
+ * array: 4
+ * null: 10
  * else: -1
  */
 int get_type_of_value(struct json_object *field_value) {
@@ -1861,6 +1865,247 @@ int get_type_of_value(struct json_object *field_value) {
         return 0x08;
     } else if (json_object_is_type(field_value, json_type_double)) {
         return 0x01;
+    } else if (json_object_is_type(field_value, json_type_object)) {
+        return  0x03;
+    } else if (json_object_is_type(field_value, json_type_array)) {
+        return  0x04;
+    } else if (json_object_is_type(field_value, json_type_null)) {
+        return  10;
     }
     return -1;
 }
+
+/**
+ * auxiliary function for reply_find_generate_array_element_i
+ * 
+ * return size of reply (bytes) if everything is fine
+ * return -1 if something went wrong
+ */
+int reply_find_generate_subelemets_string(struct json_object *data_json, char *buffer, int place_to_put) {
+    /**
+     * structure
+     * we got data_json, which have some fields. 
+     * We process them depending on their data type
+     */
+    int start_place_to_put = place_to_put;
+    int real_size = 0;
+    int now_to_put = 0;
+    int type;
+    
+
+    struct json_object_iterator it = json_object_iter_begin(data_json);
+    struct json_object_iterator it_end = json_object_iter_end(data_json);
+
+
+
+    /**
+     * meaningful element structure:
+     * type: type of value - 1 byte
+     * name of the field: - how much needed (it DOES end with '\0')
+     * lenght: 4 byte (ONLY if type is string)
+     * value:
+     */
+    while (!json_object_iter_equal(&it, &it_end)) {
+        const char *value_str;
+        char el[BUFFER_SIZE];
+        memset(el, 0, BUFFER_SIZE);
+        real_size = 0;
+        now_to_put = 0;
+        
+
+        const char *field_str = json_object_iter_peek_name(&it);
+        struct json_object *value_json = json_object_iter_peek_value(&it);
+
+        //here we get type
+        type = get_type_of_value(value_json);
+        if (type == -1) {
+            elog(WARNING, "get_type_of_value got en error: type: %d field_str: %s", type, field_str);
+            return -1;
+        }
+
+        //here we put size of the field (if needed) and field value
+        //declaration of value_str was put to cases 
+        //because in some cases call of get_json_value_as_string() leads to segfault (f.e., if type is object(Document))
+
+        //LATER: EVERYWHERE el CHANGE ON BASIC BUFFER,IT IS POSSIBLE NOW
+        switch (type){
+            case 2: //string
+                value_str = get_json_value_as_string(value_json);
+                reply_find_process_string(field_str, value_str, el, &now_to_put);
+                break;
+            case 16: //int32
+                value_str = get_json_value_as_string(value_json);
+                reply_find_process_int32(field_str, value_str, el, &now_to_put);
+                break;
+            case 8: //boolean
+                value_str = get_json_value_as_string(value_json);
+                reply_find_process_boolean(field_str, value_str, el, &now_to_put);
+                break;
+            case 1: //double
+                value_str = get_json_value_as_string(value_json);
+                reply_find_process_double(field_str, value_str, el, &now_to_put);
+                break;
+            case 4: //array
+                int array_now_to_put = reply_find_process_array(field_str, value_json, el, now_to_put);
+                if (array_now_to_put == -1) {
+                    elog(WARNING, "reply_find_generate_subelemets_string got problems with reply_find_process_array");
+                    return -1;
+                }
+                now_to_put += array_now_to_put;
+                break;
+            case 3: //object
+                //WHAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAT
+                int object_now_to_put = reply_find_process_object(field_str, value_json, el, now_to_put);
+                if (object_now_to_put == -1) {
+                    elog(WARNING, "reply_find_generate_subelemets_string got problems with reply_find_process_object, manage it");
+                    return -1;
+                }
+                now_to_put += object_now_to_put;
+                break;
+
+            default:
+                elog(WARNING, "UNCKOWN TYPE IN JSON: %d\n", type);
+                return -1;
+        }
+        //here we think that el(element string) is built
+        real_size = now_to_put;
+
+        memcpy((buffer + place_to_put), el, real_size);
+        place_to_put += real_size;
+
+        
+
+        json_object_iter_next(&it);
+    }
+    //HERE OR IN reply_find_process_object THIS SHOULD BE REMOVED(I STILL DIDN'T UNDERSTEND)
+    // buffer[place_to_put] = 0;
+    // place_to_put++;
+
+    return place_to_put - start_place_to_put;
+}
+
+
+/**
+ * process Object id
+ * return number of elements that were put to buffer
+ * if something went wrong returns -1
+ */
+int reply_find_process_oid(const char *field_str, struct json_object *data_json, char *buffer, int place_to_put) {
+    int start_place_to_put = place_to_put;
+    buffer[place_to_put] = 0x07;
+    place_to_put++;
+    memcpy((char *)(buffer + place_to_put), "_id", 4);
+    place_to_put +=4;
+    struct json_object_iterator it, it_end;
+    struct json_object *value_json;
+    const char *value_str;
+    int number_of_elements = 0;
+    char value_encoded[13];
+    int to_int ;
+
+
+    it = json_object_iter_begin(data_json);
+    it_end = json_object_iter_end(data_json);
+
+     
+    while (!json_object_iter_equal(&it, &it_end)) {
+        if (number_of_elements != 0) {
+            elog(WARNING, "reply_find_process_oid: number of elements in \"_id\" is bigger than 1!!!!!");
+            return -1;
+        }
+
+        //const char *field_str = json_object_iter_peek_name(&it);
+        value_json = json_object_iter_peek_value(&it);
+        value_str = get_json_value_as_string(value_json);
+
+        
+        memset(value_encoded, 0, 13);
+        for (int i = 0; i < strlen(value_str); i += 2) {
+            char substr[3];
+            memset(substr, 0, 3);
+            substr[0] = value_str[i];
+            substr[1] = value_str[i + 1];
+            
+            //memcpy(substr, (char *)(str + i), 2);
+            // printf("str[%d] = %c\n", i, str[i]);
+
+            
+            sscanf(substr, "%x", &to_int);
+            value_encoded[i / 2] = to_int;
+                        
+        }
+
+        memcpy((char *)(buffer + place_to_put), value_encoded, 12);
+        place_to_put +=12;
+
+
+        json_object_iter_next(&it);
+        number_of_elements++;
+    }
+    return place_to_put - start_place_to_put;
+}
+
+/**
+ * process object type
+ * return number of elements that were put to buffer
+ * if something went wrong returns -1
+ */
+int reply_find_process_object(const char *field_str, struct json_object *data_json, char *buffer, int place_to_put) {
+    int start_place_to_put = place_to_put;
+    char answer[BUFFER_SIZE];
+    int ans_size;
+    int place_for_length;
+    
+    
+    if (strcmp(field_str, "_id") == 0) {
+        int oid_size = reply_find_process_oid(field_str, data_json, buffer, place_to_put);
+        if (oid_size == -1) {
+            elog(WARNING, "reply_find_process_object: problems with processing oid");
+            return -1;
+        }
+        place_to_put += oid_size;
+        return place_to_put - start_place_to_put;
+        return -1;
+    }
+
+    /**
+     * standart Document structure:
+     * (actually, it start with place_to_put)
+     * [0] type: Document (0x03)
+     * [1 - ...] field_str(it includes 0 at rhe end of the string)
+     * [... +1 - ... + 4] Document lenght
+     * ............... then elements we got from generate_subelemets_string()
+     * 
+     * [last] = 0 - end of the Document
+     */
+
+    buffer[place_to_put] = 0x03;
+    place_to_put++;
+    memcpy((char *) (buffer + place_to_put), field_str, strlen(field_str) + 1);
+    place_to_put += strlen(field_str) + 1;
+    place_for_length = place_to_put;
+    place_to_put += 4;
+
+    
+    memset(answer, 0, BUFFER_SIZE);
+    //LATER: CHANGE 0 (reply_find_generate_subelemets_string::place_to_put) TO place_to_put
+    ans_size = reply_find_generate_subelemets_string(data_json, answer, 0);
+    if (ans_size < 0) {
+        elog(WARNING, "reply_find_generate_subelemets_string got an error");
+        return -1;
+    }
+
+    memcpy((char *)(buffer + place_to_put), answer, ans_size);
+    place_to_put += ans_size;
+
+    //HERE OR IN reply_find_generate_subelemets_string THIS SHOULD BE REMOVED(I STILL DIDN'T UNDERSTEND)
+    buffer[place_to_put] = 0;
+    place_to_put++;
+
+    //setting the Document length (it is = reply_size - 2(at the start of the document) - digits_number)
+    ((uint32_t *)(buffer + place_for_length))[0] = place_to_put - place_for_length;
+    //this is doubdtful
+    return place_to_put - start_place_to_put;
+
+}
+
